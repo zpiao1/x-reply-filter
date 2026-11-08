@@ -13,14 +13,15 @@ export type UnitVec256 = Float32Array & {
 
 export type SiameseFeatureVec = Float32Array & {
   readonly __brand: "SiameseFeatureVec";
-  readonly length: 774;
+  readonly length: 778;
 };
 
 export const RAW_EMBEDDING_DIM = 768 as const;
 export const EMBEDDING_DIM = 256 as const;
 export const SIAMESE_RELATIONAL_DIM = 768 as const;
 export const DOM_SIGNAL_DIM = 6 as const;
-export const SIAMESE_TOTAL_DIM = 774 as const;
+export const AUTHOR_FEATURE_DIM = 4 as const;
+export const SIAMESE_TOTAL_DIM = 778 as const;
 
 export const OP_MIN_TOKENS = 5 as const;
 export const REPLY_MIN_TOKENS = 6 as const;
@@ -177,6 +178,51 @@ export function computeAuthorSpamPrior(stats: AuthorStats | undefined): number {
   const neg = stats.humanCount * 2.0;
   const denom = pos + neg + 2.0;
   return (pos - neg) / denom;
+}
+
+export interface AuthorModelFeatures {
+  readonly spamRate: number;
+  readonly spamVolume: number;
+  readonly humanRate: number;
+  readonly handleBotScore: number;
+}
+
+export function computeHandleBotPatternScore(authorId: AuthorId): number {
+  const trailingMatch = /(\d+)$/.exec(authorId);
+  const trailingDigits = trailingMatch?.[1]?.length ?? 0;
+  let score = 0;
+  if (trailingDigits >= 6) {
+    score = 0.85;
+  } else if (trailingDigits >= 4) {
+    score = 0.55;
+  } else if (trailingDigits === 3) {
+    score = 0.35;
+  }
+  const allDigits = (authorId.match(/\d/g) ?? []).length;
+  if (authorId.length > 0 && allDigits / authorId.length > 0.4) {
+    score = Math.min(1, score + 0.15);
+  }
+  return score;
+}
+
+export function extractAuthorModelFeatures(
+  authorId: AuthorId,
+  stats: AuthorStats | undefined,
+): AuthorModelFeatures {
+  const spam = stats?.spamCount ?? 0;
+  const human = stats?.humanCount ?? 0;
+  const autoFlag = stats?.autoFlagCount ?? 0;
+  const effectiveSpam = spam + 0.5 * autoFlag;
+  const spamRate = effectiveSpam / (effectiveSpam + human + 1);
+  const spamVolume = Math.tanh((spam + 0.35 * autoFlag) * 0.75);
+  const humanRate = human / (spam + human + 1);
+  const handleBotScore = computeHandleBotPatternScore(authorId);
+  return {
+    spamRate,
+    spamVolume,
+    humanRate,
+    handleBotScore,
+  };
 }
 
 const TWEET_ID_PATTERN = /^\d{1,32}$/;

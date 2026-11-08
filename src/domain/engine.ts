@@ -9,6 +9,7 @@ import {
   type CandidateTweet,
   DEFAULT_SLAB_CAPACITY,
   DEFAULT_THRESHOLDS,
+  DOM_SIGNAL_DIM,
   type DomSignals,
   EMBEDDING_DIM,
   type EmbeddedTweet,
@@ -31,6 +32,7 @@ import {
   asProbability,
   asUnitCosine,
   computeAuthorSpamPrior,
+  extractAuthorModelFeatures,
 } from "./types.ts";
 
 export interface BatchEvaluationResult {
@@ -239,16 +241,19 @@ export function buildSiameseFeatures(
   replyVec: UnitVec256,
   anchor: ThreadAnchorState,
   signals: DomSignals,
+  authorId: AuthorId = "anonymous" as AuthorId,
+  authorStats?: AuthorStats | undefined,
 ): SiameseFeatureVec {
   const out = new Float32Array(SIAMESE_TOTAL_DIM);
   out.set(replyVec, 0);
 
   if (anchor.kind === "text_anchored") {
     const opVec = anchor.embedding;
+    const cos = dotProduct256(opVec, replyVec);
     for (let i = 0; i < EMBEDDING_DIM; i++) {
       const u = opVec[i] ?? 0;
       const v = replyVec[i] ?? 0;
-      out[EMBEDDING_DIM + i] = Math.abs(u - v);
+      out[EMBEDDING_DIM + i] = v - cos * u;
       out[EMBEDDING_DIM * 2 + i] = u * v;
     }
   }
@@ -260,6 +265,13 @@ export function buildSiameseFeatures(
   out[SIAMESE_RELATIONAL_DIM + 4] = signals.cjkCharRatio;
   out[SIAMESE_RELATIONAL_DIM + 5] = signals.matchedSpamKeyword !== null ? 1 : 0;
 
+  const authorFeatures = extractAuthorModelFeatures(authorId, authorStats);
+  const authorBase = SIAMESE_RELATIONAL_DIM + DOM_SIGNAL_DIM;
+  out[authorBase + 0] = authorFeatures.spamRate;
+  out[authorBase + 1] = authorFeatures.spamVolume;
+  out[authorBase + 2] = authorFeatures.humanRate;
+  out[authorBase + 3] = authorFeatures.handleBotScore;
+
   return out as SiameseFeatureVec;
 }
 
@@ -268,7 +280,6 @@ export function scoreSiameseHead(
   replyVec: UnitVec256,
   rawText: string,
   classifier: OnlineClassifierWeights,
-  authorSpamPrior = 0,
 ): { readonly probability: Probability; readonly dominantLanguage: SupportedLanguage } {
   let linearMargin = classifier.bias;
   for (let i = 0; i < SIAMESE_TOTAL_DIM; i++) {
@@ -291,8 +302,7 @@ export function scoreSiameseHead(
 
   const prototypeMargin =
     bestPosSim >= 0 && bestNegSim >= 0 ? (bestPosSim - bestNegSim) * 1.5 : 0;
-  const authorMargin = authorSpamPrior * 1.35;
-  const logit = linearMargin + prototypeMargin + authorMargin;
+  const logit = linearMargin + prototypeMargin;
   const prob = 1 / (1 + Math.exp(-logit));
   const dominantLanguage = bestPosLang ?? detectDominantLanguage(rawText);
 
@@ -333,7 +343,7 @@ export function updateOnlineWeightsPassiveAggressive(
 
   return {
     weights: nextWeights,
-    bias: current.bias + step,
+    bias: current.bias + step * 0.1,
     seedPrototypes: current.seedPrototypes,
     updateCount: current.updateCount + 1,
     authorStats: current.authorStats,
@@ -620,22 +630,23 @@ export class ThreadFilterEngine {
           ? dotProduct256(slab.anchor.embedding, item.embedding)
           : asUnitCosine(0);
 
+      const authorStats = classifier.authorStats.get(item.candidate.authorId);
+      const authorSpamPrior = computeAuthorSpamPrior(authorStats);
+
       const features = buildSiameseFeatures(
         item.embedding,
         slab.anchor,
         item.candidate.domSignals,
+        item.candidate.authorId,
+        authorStats,
       );
       slab.featuresByTweetId.set(item.candidate.tweetId, features);
-
-      const authorStats = classifier.authorStats.get(item.candidate.authorId);
-      const authorSpamPrior = computeAuthorSpamPrior(authorStats);
 
       const { probability, dominantLanguage } = scoreSiameseHead(
         features,
         item.embedding,
         item.candidate.rawText,
         classifier,
-        authorSpamPrior,
       );
 
       const verdict = evaluateReplyRules(
@@ -710,6 +721,17 @@ export class ThreadFilterEngine {
     const updatedStats = authorId !== undefined ? nextWeights.authorStats.get(authorId) : undefined;
     const updatedPrior = computeAuthorSpamPrior(updatedStats);
 
+    if (authorId !== undefined) {
+      const updatedFeatures = new Float32Array(features) as SiameseFeatureVec;
+      const af = extractAuthorModelFeatures(authorId, updatedStats);
+      const authorBase = SIAMESE_RELATIONAL_DIM + DOM_SIGNAL_DIM;
+      updatedFeatures[authorBase + 0] = af.spamRate;
+      updatedFeatures[authorBase + 1] = af.spamVolume;
+      updatedFeatures[authorBase + 2] = af.humanRate;
+      updatedFeatures[authorBase + 3] = af.handleBotScore;
+      slab.featuresByTweetId.set(tweetId, updatedFeatures);
+    }
+
     const updatedVerdict: VerdictRecord = {
       ...priorVerdict,
       action: label === "spam" ? "dim" : "keep",
@@ -732,13 +754,13 @@ export class ThreadFilterEngine {
     slab.verdictsByTweetId.set(tweetId, updatedVerdict);
 
     const retroactiveUpdates: VerdictRecord[] = [];
-    if (
-      label === "spam" &&
-      authorId !== undefined &&
-      updatedStats !== undefined &&
-      updatedStats.spamCount >= this.thresholds.authorKnownBotMinSpam &&
-      updatedStats.spamCount > updatedStats.humanCount * 2
-    ) {
+    if (label === "spam" && authorId !== undefined && updatedStats !== undefined) {
+      const af = extractAuthorModelFeatures(authorId, updatedStats);
+      const authorBase = SIAMESE_RELATIONAL_DIM + DOM_SIGNAL_DIM;
+      const isKnownBot =
+        updatedStats.spamCount >= this.thresholds.authorKnownBotMinSpam &&
+        updatedStats.spamCount > updatedStats.humanCount * 2;
+
       for (let s = 0; s < slab.count; s++) {
         const peerTweetId = slab.replyTweetIds[s];
         if (peerTweetId === undefined || peerTweetId === tweetId) {
@@ -748,20 +770,47 @@ export class ThreadFilterEngine {
           continue;
         }
         const peerVerdict = slab.verdictsByTweetId.get(peerTweetId);
-        if (peerVerdict && peerVerdict.action === "keep") {
+        const peerFeatures = slab.featuresByTweetId.get(peerTweetId);
+        if (!peerVerdict || peerVerdict.action !== "keep" || !peerFeatures) {
+          continue;
+        }
+
+        const nextPeerFeatures = new Float32Array(peerFeatures) as SiameseFeatureVec;
+        nextPeerFeatures[authorBase + 0] = af.spamRate;
+        nextPeerFeatures[authorBase + 1] = af.spamVolume;
+        nextPeerFeatures[authorBase + 2] = af.humanRate;
+        nextPeerFeatures[authorBase + 3] = af.handleBotScore;
+        slab.featuresByTweetId.set(peerTweetId, nextPeerFeatures);
+
+        const peerVec = nextPeerFeatures.subarray(0, EMBEDDING_DIM) as unknown as UnitVec256;
+        const peerSnippet = slab.replySnippets[s] ?? "";
+        const reScored = scoreSiameseHead(nextPeerFeatures, peerVec, peerSnippet, nextWeights);
+
+        if (isKnownBot || reScored.probability >= this.thresholds.siameseScoreThreshold) {
+          const promotedReason: FilterReason = isKnownBot
+            ? {
+                kind: "known_bot_author",
+                action: "dim",
+                authorId,
+                spamCount: updatedStats.spamCount,
+              }
+            : {
+                kind: "siamese_bot",
+                action: "dim",
+                probability: reScored.probability,
+                dominantLanguage: reScored.dominantLanguage,
+                opFallback: slab.anchor.kind !== "text_anchored",
+              };
+
           const promoted: VerdictRecord = {
             ...peerVerdict,
             action: "dim",
-            score: 1,
-            reason: {
-              kind: "known_bot_author",
-              action: "dim",
-              authorId,
-              spamCount: updatedStats.spamCount,
-            },
+            score: isKnownBot ? 1 : reScored.probability,
+            reason: promotedReason,
             diagnostics: peerVerdict.diagnostics
               ? {
                   ...peerVerdict.diagnostics,
+                  siameseProbability: reScored.probability,
                   authorSpamPrior: updatedPrior,
                   authorSpamCount: updatedStats.spamCount,
                   authorHumanCount: updatedStats.humanCount,

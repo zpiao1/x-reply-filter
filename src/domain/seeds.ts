@@ -1,6 +1,7 @@
 import {
   type AuthorId,
   type AuthorStats,
+  DOM_SIGNAL_DIM,
   type DomSignals,
   EMBEDDING_DIM,
   SIAMESE_RELATIONAL_DIM,
@@ -160,6 +161,12 @@ export function createInitialClassifierWeights(
   weights[SIAMESE_RELATIONAL_DIM + 3] = 0.85;
   weights[SIAMESE_RELATIONAL_DIM + 4] = 0.0;
   weights[SIAMESE_RELATIONAL_DIM + 5] = 1.8;
+
+  const authorBase = SIAMESE_RELATIONAL_DIM + DOM_SIGNAL_DIM;
+  weights[authorBase + 0] = 0.75;
+  weights[authorBase + 1] = 0.55;
+  weights[authorBase + 2] = -1.1;
+  weights[authorBase + 3] = 0.45;
 
   return {
     weights,

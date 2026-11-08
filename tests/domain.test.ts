@@ -383,6 +383,46 @@ describe("ThreadFilterEngine 3-in-1 detection and edge-case invariants", () => {
     weights = fb1.nextWeights;
     assert.equal(weights.authorStats.get("repeat_spammer" as AuthorId)?.spamCount, 1);
 
+    const anchorState = {
+      kind: "text_anchored" as const,
+      tweetId: op.tweetId,
+      authorId: op.authorId,
+      tokenCount: asTokenCount(10),
+      embedding: makeUnitVec(0),
+    };
+    const probeVec = makeUnitVec(99);
+    const cleanAuthorFeatures = buildSiameseFeatures(
+      probeVec,
+      anchorState,
+      botReply1.domSignals,
+      "clean_human" as AuthorId,
+      undefined,
+    );
+    const repeatAuthorFeatures = buildSiameseFeatures(
+      probeVec,
+      anchorState,
+      botReply1.domSignals,
+      "repeat_spammer" as AuthorId,
+      weights.authorStats.get("repeat_spammer" as AuthorId),
+    );
+    const botHandleFeatures = buildSiameseFeatures(
+      probeVec,
+      anchorState,
+      botReply1.domSignals,
+      "tianata3005" as AuthorId,
+      undefined,
+    );
+    assert.equal(repeatAuthorFeatures.length, 778);
+    assert(repeatAuthorFeatures[774]! > 0, "author spamRate feature populated in SiameseFeatureVec[774]");
+    assert(repeatAuthorFeatures[775]! > 0, "author spamVolume feature populated in SiameseFeatureVec[775]");
+    assert(botHandleFeatures[777]! > 0, "handleBotScore feature populated in SiameseFeatureVec[777]");
+
+    const cleanProb = scoreSiameseHead(cleanAuthorFeatures, probeVec, botReply1.rawText, weights).probability;
+    const repeatProb = scoreSiameseHead(repeatAuthorFeatures, probeVec, botReply1.rawText, weights).probability;
+    const botHandleProb = scoreSiameseHead(botHandleFeatures, probeVec, botReply1.rawText, weights).probability;
+    assert(repeatProb > cleanProb, "Siamese model scores repeat_spammer higher via learned author feature slots");
+    assert(botHandleProb > cleanProb, "Siamese model scores digit-suffixed bot handles higher via feature slot 777");
+
     const fb2 = engine.applyUserFeedback(threadId, botReply2.tweetId, "spam", weights);
     assert(fb2 !== null);
     weights = fb2.nextWeights;

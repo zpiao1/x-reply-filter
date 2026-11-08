@@ -397,9 +397,14 @@ export class IndexedDbWeightStore {
       db.close();
 
       const defaults = createInitialClassifierWeights();
-      if (payload && payload.weights instanceof Float32Array && payload.weights.length === SIAMESE_TOTAL_DIM) {
+      if (payload && payload.weights instanceof Float32Array) {
+        const migratedWeights = new Float32Array(defaults.weights);
+        const copyLen = Math.min(payload.weights.length, SIAMESE_TOTAL_DIM);
+        for (let i = 0; i < copyLen; i++) {
+          migratedWeights[i] = payload.weights[i]!;
+        }
         this.memoryFallback = {
-          weights: new Float32Array(payload.weights),
+          weights: migratedWeights,
           bias: payload.bias,
           seedPrototypes: defaults.seedPrototypes,
           updateCount: payload.updateCount,
