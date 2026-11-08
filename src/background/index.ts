@@ -53,6 +53,26 @@ export function registerBackgroundRouter(): void {
 
     return true;
   });
+
+  if (chrome.runtime.onInstalled && chrome.tabs && chrome.scripting) {
+    chrome.runtime.onInstalled.addListener(() => {
+      void chrome.tabs
+        .query({ url: ["https://x.com/*", "https://twitter.com/*"] })
+        .then((tabs) => {
+          for (const tab of tabs) {
+            if (tab.id !== undefined) {
+              void chrome.scripting
+                .executeScript({
+                  target: { tabId: tab.id },
+                  files: ["content.js"],
+                })
+                .catch(() => {});
+            }
+          }
+        })
+        .catch(() => {});
+    });
+  }
 }
 
 if (typeof chrome !== "undefined" && chrome.runtime?.onMessage && chrome.offscreen) {

@@ -156,6 +156,11 @@ describe("XThreadDomAdapter extraction, cutoff, and zero-jitter dimming", () => 
 
     assert.equal(botArticle.getAttribute("data-xrf-state"), "dimmed");
     assert.equal(botArticle.getAttribute("data-xrf-reason"), "op_paraphrase");
+    assert.equal(
+      botArticle.querySelector(".xrf-badge")?.textContent,
+      "@bot_account · AI paraphrase (91%)",
+      "collapsed 1-line bar includes the reply author handle alongside the filter reason",
+    );
     assert.equal(jpArticle.getAttribute("data-xrf-state"), "clean");
 
     const toggleBtn = botArticle.querySelector(".xrf-toggle-btn") as HTMLButtonElement | null;

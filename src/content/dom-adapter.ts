@@ -28,13 +28,16 @@ const DISCOVER_MORE_HEADINGS: ReadonlyArray<RegExp> = [
 const STYLE_ELEMENT_ID = "xrf-injected-styles" as const;
 
 const XRF_STYLESHEET = `
-article[data-xrf-state="dimmed"] [data-testid="tweetText"],
-article[data-xrf-state="dimmed"] [data-testid="tweetPhoto"],
-article[data-xrf-state="dimmed"] [data-testid="videoPlayer"],
-article[data-xrf-state="dimmed"] [data-testid="card.wrapper"] {
-  opacity: 0.22 !important;
-  filter: blur(3.5px) !important;
-  transition: opacity 120ms ease, filter 120ms ease !important;
+article[data-xrf-state="dimmed"] *:not(:has(.xrf-control-bar)):not(.xrf-control-bar):not(.xrf-control-bar *) {
+  display: none !important;
+}
+article[data-xrf-state="dimmed"],
+article[data-xrf-state="dimmed"] *:has(.xrf-control-bar) {
+  padding-top: 2px !important;
+  padding-bottom: 2px !important;
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+  min-height: 0 !important;
 }
 article[data-xrf-state="revealed"] [data-testid="tweetText"],
 article[data-xrf-state="revealed"] [data-testid="tweetPhoto"],
@@ -62,6 +65,10 @@ article[data-xrf-state="revealed"] [data-testid="card.wrapper"] {
   background: rgba(120, 120, 128, 0.14);
   color: rgb(139, 152, 165);
   user-select: none;
+}
+article[data-xrf-state="dimmed"] .xrf-control-bar {
+  margin-top: 2px !important;
+  margin-bottom: 2px !important;
 }
 .xrf-control-bar[data-xrf-bar-action="dim"] {
   background: rgba(244, 33, 46, 0.14);
@@ -91,13 +98,15 @@ article[data-testid="tweet"]:hover .xrf-control-bar[data-xrf-bar-action="keep"] 
 `;
 
 export function ensureStylesInjected(doc: Document): void {
-  if (doc.getElementById(STYLE_ELEMENT_ID)) {
-    return;
+  let style = doc.getElementById(STYLE_ELEMENT_ID);
+  if (style === null) {
+    style = doc.createElement("style");
+    style.id = STYLE_ELEMENT_ID;
+    (doc.head ?? doc.documentElement).appendChild(style);
   }
-  const style = doc.createElement("style");
-  style.id = STYLE_ELEMENT_ID;
-  style.textContent = XRF_STYLESHEET;
-  (doc.head ?? doc.documentElement).appendChild(style);
+  if (style.textContent !== XRF_STYLESHEET) {
+    style.textContent = XRF_STYLESHEET;
+  }
 }
 
 export function isDiscoverMoreDivider(cell: Element): boolean {
@@ -361,7 +370,12 @@ export class XThreadDomAdapter {
       if (verdict.action === "dim") {
         const badge = ownerDoc.createElement("span");
         badge.className = "xrf-badge";
-        badge.textContent = formatFilterReasonBadge(verdict.reason);
+        const resolvedAuthor = verdict.authorId ?? extractStatusIdentity(article)?.authorId;
+        const baseBadge = formatFilterReasonBadge(verdict.reason);
+        badge.textContent =
+          resolvedAuthor && verdict.reason.kind !== "known_bot_author"
+            ? `@${resolvedAuthor} · ${baseBadge}`
+            : baseBadge;
         bar.appendChild(badge);
 
         const toggleBtn = ownerDoc.createElement("button");

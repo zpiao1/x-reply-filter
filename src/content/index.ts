@@ -20,44 +20,72 @@ function isXrfInternalNode(node: Node | null): boolean {
   return false;
 }
 
+function isExtensionContextValid(): boolean {
+  if (typeof chrome === "undefined" || !chrome.runtime) {
+    return true;
+  }
+  return Boolean(chrome.runtime.id);
+}
+
 export async function runScrollPass(
   doc: Document,
   pathname: string,
   adapter: XThreadDomAdapter,
   sendRpc: (req: OffscreenRpcRequest) => Promise<OffscreenRpcResponse>,
 ): Promise<void> {
+  if (!isExtensionContextValid()) {
+    return;
+  }
   const snapshot = adapter.extractThreadSnapshot(doc, pathname);
   if (snapshot === null || snapshot.candidates.length === 0 || !snapshot.hasUnscoredReplies) {
     return;
   }
 
-  const response = await sendRpc({
-    kind: "evaluate_batch",
-    threadId: snapshot.threadId,
-    candidates: snapshot.candidates,
-    target: "background",
-  });
+  let response: OffscreenRpcResponse;
+  try {
+    response = await sendRpc({
+      kind: "evaluate_batch",
+      threadId: snapshot.threadId,
+      candidates: snapshot.candidates,
+      target: "background",
+    });
+  } catch {
+    return;
+  }
 
   if (response.kind !== "evaluate_batch_ok") {
     return;
   }
 
-  const handleFeedback = (tweetId: Parameters<typeof adapter.applyVerdictsInPlace>[2] extends (id: infer T, l: "spam" | "human") => void ? T : never, label: "spam" | "human"): void => {
+  const handleFeedback = (
+    tweetId: Parameters<typeof adapter.applyVerdictsInPlace>[2] extends (
+      id: infer T,
+      l: "spam" | "human",
+    ) => void
+      ? T
+      : never,
+    label: "spam" | "human",
+  ): void => {
+    if (!isExtensionContextValid()) {
+      return;
+    }
     void sendRpc({
       kind: "record_feedback",
       threadId: snapshot.threadId,
       tweetId,
       label,
       target: "background",
-    }).then((feedbackRes) => {
-      if (feedbackRes.kind === "record_feedback_ok" && feedbackRes.updatedVerdict !== null) {
-        const updates = [
-          feedbackRes.updatedVerdict,
-          ...(feedbackRes.retroactiveUpdates ?? []),
-        ];
-        adapter.applyVerdictsInPlace(doc, updates, handleFeedback);
-      }
-    });
+    })
+      .then((feedbackRes) => {
+        if (feedbackRes.kind === "record_feedback_ok" && feedbackRes.updatedVerdict !== null) {
+          const updates = [
+            feedbackRes.updatedVerdict,
+            ...(feedbackRes.retroactiveUpdates ?? []),
+          ];
+          adapter.applyVerdictsInPlace(doc, updates, handleFeedback);
+        }
+      })
+      .catch(() => {});
   };
 
   const allUpdates = [...response.result.verdicts, ...response.result.retroactiveUpdates];
@@ -74,16 +102,28 @@ export function mountThreadObserver(
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   const schedulePass = (): void => {
+    if (!isExtensionContextValid()) {
+      observer.disconnect();
+      return;
+    }
     if (timer !== null) {
       clearTimeout(timer);
     }
     timer = setTimeout(() => {
       timer = null;
+      if (!isExtensionContextValid()) {
+        observer.disconnect();
+        return;
+      }
       void runScrollPass(doc, getPathname(), adapter, sendRpc);
     }, debounceMs);
   };
 
   const observer = new MutationObserver((mutations) => {
+    if (!isExtensionContextValid()) {
+      observer.disconnect();
+      return;
+    }
     const hasExternalMutation = mutations.some((m) => !isXrfInternalNode(m.target));
     if (hasExternalMutation) {
       schedulePass();
@@ -115,7 +155,15 @@ export function mountThreadObserver(
   };
 }
 
-if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage && typeof document !== "undefined") {
+if (
+  typeof chrome !== "undefined" &&
+  typeof chrome.runtime?.sendMessage === "function" &&
+  typeof document !== "undefined"
+) {
+  for (const article of Array.from(document.querySelectorAll("article[data-xrf-state]"))) {
+    article.removeAttribute("data-xrf-state");
+    article.removeAttribute("data-xrf-reason");
+  }
   const sendRpc = (req: OffscreenRpcRequest): Promise<OffscreenRpcResponse> =>
     chrome.runtime.sendMessage(req) as Promise<OffscreenRpcResponse>;
   mountThreadObserver(document, sendRpc);
