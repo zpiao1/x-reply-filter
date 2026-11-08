@@ -40,21 +40,35 @@ article[data-xrf-state="revealed"] [data-testid="card.wrapper"] {
   filter: none !important;
 }
 .xrf-control-bar {
-  display: inline-flex;
-  align-items: center;
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  align-self: flex-start !important;
+  flex: 0 0 auto !important;
+  width: fit-content !important;
+  max-width: 100% !important;
+  height: auto !important;
   gap: 6px;
-  margin-top: 4px;
+  margin-top: 6px;
   padding: 2px 8px;
-  border-radius: 9999px;
+  border-radius: 6px;
   font-size: 11px;
   line-height: 16px;
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: rgba(120, 120, 128, 0.14);
-  color: inherit;
+  color: rgb(139, 152, 165);
   user-select: none;
 }
 .xrf-control-bar[data-xrf-bar-action="dim"] {
   background: rgba(244, 33, 46, 0.14);
+  color: rgb(244, 113, 120);
+}
+.xrf-control-bar[data-xrf-bar-action="keep"] {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+article[data-testid="tweet"]:hover .xrf-control-bar[data-xrf-bar-action="keep"] {
+  opacity: 0.85;
 }
 .xrf-btn {
   border: none;
@@ -133,14 +147,26 @@ function extractStatusIdentity(
   return null;
 }
 
-function extractPrimaryTweetText(article: Element): string {
+function extractPrimaryTweetTextNode(article: Element): Element | null {
   const textNodes = Array.from(article.querySelectorAll('[data-testid="tweetText"]'));
   for (const node of textNodes) {
     if (!isInsideQuoteTweet(node, article)) {
-      return (node.textContent ?? "").trim();
+      return node;
     }
   }
-  return "";
+  return null;
+}
+
+function findControlMountContainer(article: Element): Element {
+  const textNode = extractPrimaryTweetTextNode(article);
+  if (textNode?.parentElement && textNode.parentElement !== article) {
+    return textNode.parentElement;
+  }
+  const actionGroup = article.querySelector('div[role="group"]');
+  if (actionGroup?.parentElement && actionGroup.parentElement !== article) {
+    return actionGroup.parentElement;
+  }
+  return article;
 }
 
 export function formatFilterReasonBadge(reason: FilterReason): string {
@@ -161,14 +187,17 @@ export function formatFilterReasonBadge(reason: FilterReason): string {
   }
 }
 
+export interface ThreadDomSnapshot {
+  readonly threadId: ThreadId;
+  readonly candidates: ReadonlyArray<CandidateTweet>;
+  readonly hasUnscoredReplies: boolean;
+}
+
 export class XThreadDomAdapter {
   public extractThreadSnapshot(
     root: ParentNode,
     locationPathname: string,
-  ): {
-    readonly threadId: ThreadId;
-    readonly candidates: ReadonlyArray<CandidateTweet>;
-  } | null {
+  ): ThreadDomSnapshot | null {
     const threadId = parseThreadId(locationPathname);
     if (threadId === null) {
       return null;
@@ -192,15 +221,25 @@ export class XThreadDomAdapter {
     }
 
     const candidates: CandidateTweet[] = [];
+    let hasUnscoredReplies = false;
+
     for (const article of articles) {
       const identity = extractStatusIdentity(article);
       if (identity === null) {
         continue;
       }
 
-      article.setAttribute("data-xrf-tweet-id", identity.tweetId);
+      if (article.getAttribute("data-xrf-tweet-id") !== identity.tweetId) {
+        article.setAttribute("data-xrf-tweet-id", identity.tweetId);
+      }
 
-      const rawText = extractPrimaryTweetText(article);
+      const isOp = identity.tweetId === (threadId as unknown as TweetId);
+      if (!isOp && article.getAttribute("data-xrf-state") === null) {
+        hasUnscoredReplies = true;
+      }
+
+      const textNode = extractPrimaryTweetTextNode(article);
+      const rawText = (textNode?.textContent ?? "").trim();
       const hasVerifiedBadge =
         article.querySelector('[data-testid="icon-verified"]') !== null;
       const hasMediaOrExternalLink =
@@ -219,31 +258,12 @@ export class XThreadDomAdapter {
         authorId: identity.authorId,
         rawText,
         normalizedText: rawText,
-        isOp: identity.tweetId === (threadId as unknown as TweetId),
+        isOp,
         domSignals,
       });
     }
 
-    return { threadId, candidates };
-  }
-
-  public setOpStatusPill(root: ParentNode, threadId: ThreadId, statusText: string): void {
-    const ownerDoc = "createElement" in root ? (root as Document) : root.ownerDocument;
-    if (ownerDoc === null) {
-      return;
-    }
-    ensureStylesInjected(ownerDoc);
-    const opArticle = root.querySelector(`article[data-xrf-tweet-id="${threadId}"]`);
-    if (opArticle === null) {
-      return;
-    }
-    let pill = opArticle.querySelector(".xrf-op-status");
-    if (pill === null) {
-      pill = ownerDoc.createElement("div");
-      pill.className = "xrf-control-bar xrf-op-status";
-      opArticle.appendChild(pill);
-    }
-    pill.textContent = statusText;
+    return { threadId, candidates, hasUnscoredReplies };
   }
 
   public applyVerdictsInPlace(
@@ -285,11 +305,14 @@ export class XThreadDomAdapter {
       article.setAttribute("data-xrf-state", targetState);
       article.setAttribute("data-xrf-reason", verdict.reason.kind);
 
+      const mountTarget = findControlMountContainer(article);
       let bar = article.querySelector(".xrf-control-bar");
       if (bar === null) {
         bar = ownerDoc.createElement("div");
         bar.className = "xrf-control-bar";
-        article.appendChild(bar);
+        mountTarget.appendChild(bar);
+      } else if (bar.parentElement !== mountTarget) {
+        mountTarget.appendChild(bar);
       }
 
       bar.setAttribute("data-xrf-bar-action", verdict.action);

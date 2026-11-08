@@ -7,6 +7,19 @@ export interface ThreadObserverHandle {
   readonly dispose: () => void;
 }
 
+function isXrfInternalNode(node: Node | null): boolean {
+  let curr: Node | null = node;
+  while (curr !== null) {
+    if (curr instanceof Element) {
+      if (curr.classList.contains("xrf-control-bar") || curr.id === "xrf-injected-styles") {
+        return true;
+      }
+    }
+    curr = curr.parentNode;
+  }
+  return false;
+}
+
 export async function runScrollPass(
   doc: Document,
   pathname: string,
@@ -14,11 +27,9 @@ export async function runScrollPass(
   sendRpc: (req: OffscreenRpcRequest) => Promise<OffscreenRpcResponse>,
 ): Promise<void> {
   const snapshot = adapter.extractThreadSnapshot(doc, pathname);
-  if (snapshot === null || snapshot.candidates.length === 0) {
+  if (snapshot === null || snapshot.candidates.length === 0 || !snapshot.hasUnscoredReplies) {
     return;
   }
-
-  adapter.setOpStatusPill(doc, snapshot.threadId, "XRF: scoring thread (first run downloads ~300MB model)...");
 
   const response = await sendRpc({
     kind: "evaluate_batch",
@@ -28,18 +39,10 @@ export async function runScrollPass(
   });
 
   if (response.kind !== "evaluate_batch_ok") {
-    const errMsg = response.kind === "rpc_error" ? response.message : "unknown error";
-    adapter.setOpStatusPill(doc, snapshot.threadId, `XRF error: ${errMsg}`);
     return;
   }
 
   const allUpdates = [...response.result.verdicts, ...response.result.retroactiveUpdates];
-  const dimmedCount = allUpdates.filter((v) => v.action === "dim").length;
-  adapter.setOpStatusPill(
-    doc,
-    snapshot.threadId,
-    `XRF active (${dimmedCount} dimmed / ${allUpdates.length} replies)`,
-  );
   adapter.applyVerdictsInPlace(doc, allUpdates, (tweetId, label) => {
     void sendRpc({
       kind: "record_feedback",
@@ -74,8 +77,11 @@ export function mountThreadObserver(
     }, debounceMs);
   };
 
-  const observer = new MutationObserver(() => {
-    schedulePass();
+  const observer = new MutationObserver((mutations) => {
+    const hasExternalMutation = mutations.some((m) => !isXrfInternalNode(m.target));
+    if (hasExternalMutation) {
+      schedulePass();
+    }
   });
 
   observer.observe(doc.body ?? doc.documentElement, {

@@ -30,9 +30,11 @@ function buildMockXThreadDocument(dividerText = "Discover more"): Document {
           </div>
           <div data-testid="cellInnerDiv">
             <article data-testid="tweet">
-              <svg data-testid="icon-verified"></svg>
-              <a href="/bot_account/status/1001"><time datetime="2026-11-08T12:00:12Z"></time></a>
-              <div data-testid="tweetText">Spot on! Local WebGPU inference really changes everything. What do you think?</div>
+              <div class="tweet-body">
+                <svg data-testid="icon-verified"></svg>
+                <a href="/bot_account/status/1001"><time datetime="2026-11-08T12:00:12Z"></time></a>
+                <div data-testid="tweetText">Spot on! Local WebGPU inference really changes everything. What do you think?</div>
+              </div>
             </article>
           </div>
           <div data-testid="cellInnerDiv">
@@ -177,5 +179,18 @@ describe("XThreadDomAdapter extraction, cutoff, and zero-jitter dimming", () => 
     assert.equal(requests.some((r) => r.kind === "record_feedback" && r.label === "human"), true);
     assert.equal(botArticle.getAttribute("data-xrf-state"), "clean");
     assert.equal(botArticle.getAttribute("data-xrf-reason"), "user_override");
+
+    const rpcCountBeforeIdlePass = requests.length;
+    await runScrollPass(doc, "/op_author/status/1000", adapter, sendRpc);
+    assert.equal(
+      requests.length,
+      rpcCountBeforeIdlePass,
+      "subsequent scroll pass with no new unscored tweets must not fire RPC or flicker status",
+    );
+    assert.equal(
+      botArticle.children[botArticle.children.length - 1]?.classList.contains("xrf-control-bar"),
+      false,
+      "control bar must mount inside the tweet content column, not as a direct flex-row child of article",
+    );
   });
 });
