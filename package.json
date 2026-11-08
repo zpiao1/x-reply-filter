@@ -1,0 +1,22 @@
+{
+  "name": "x-reply-filter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local WebGPU Chrome MV3 extension that dims AI bot and spam replies on X across English, Chinese, and Japanese using EmbeddingGemma-300M.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "test": "node --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.8.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.313",
+    "@types/node": "^22.13.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
