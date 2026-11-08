@@ -227,6 +227,25 @@ export class XThreadDomAdapter {
     return { threadId, candidates };
   }
 
+  public setOpStatusPill(root: ParentNode, threadId: ThreadId, statusText: string): void {
+    const ownerDoc = "createElement" in root ? (root as Document) : root.ownerDocument;
+    if (ownerDoc === null) {
+      return;
+    }
+    ensureStylesInjected(ownerDoc);
+    const opArticle = root.querySelector(`article[data-xrf-tweet-id="${threadId}"]`);
+    if (opArticle === null) {
+      return;
+    }
+    let pill = opArticle.querySelector(".xrf-op-status");
+    if (pill === null) {
+      pill = ownerDoc.createElement("div");
+      pill.className = "xrf-control-bar xrf-op-status";
+      opArticle.appendChild(pill);
+    }
+    pill.textContent = statusText;
+  }
+
   public applyVerdictsInPlace(
     root: ParentNode,
     verdicts: ReadonlyArray<VerdictRecord>,

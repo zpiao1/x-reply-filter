@@ -32,7 +32,7 @@ export const MAX_CACHED_THREADS = 16 as const;
 export const DEFAULT_SLAB_CAPACITY = 512 as const;
 export const OFFSCREEN_IDLE_TIMEOUT_MS = 600_000 as const;
 export const SCROLL_DEBOUNCE_MS = 80 as const;
-export const CLASSIFICATION_TASK_PREFIX = "task: classification | text: " as const;
+export const CLASSIFICATION_TASK_PREFIX = "task: classification | query: " as const;
 
 export type SupportedLanguage = "en" | "zh" | "ja";
 

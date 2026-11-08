@@ -18,6 +18,8 @@ export async function runScrollPass(
     return;
   }
 
+  adapter.setOpStatusPill(doc, snapshot.threadId, "XRF: scoring thread (first run downloads ~300MB model)...");
+
   const response = await sendRpc({
     kind: "evaluate_batch",
     threadId: snapshot.threadId,
@@ -26,10 +28,18 @@ export async function runScrollPass(
   });
 
   if (response.kind !== "evaluate_batch_ok") {
+    const errMsg = response.kind === "rpc_error" ? response.message : "unknown error";
+    adapter.setOpStatusPill(doc, snapshot.threadId, `XRF error: ${errMsg}`);
     return;
   }
 
   const allUpdates = [...response.result.verdicts, ...response.result.retroactiveUpdates];
+  const dimmedCount = allUpdates.filter((v) => v.action === "dim").length;
+  adapter.setOpStatusPill(
+    doc,
+    snapshot.threadId,
+    `XRF active (${dimmedCount} dimmed / ${allUpdates.length} replies)`,
+  );
   adapter.applyVerdictsInPlace(doc, allUpdates, (tweetId, label) => {
     void sendRpc({
       kind: "record_feedback",

@@ -4,7 +4,13 @@
   "version": "0.1.0",
   "description": "Locally dims AI bot paraphrases, thread clones, and spam replies on X across English, Chinese, and Japanese using EmbeddingGemma-300M on WebGPU.",
   "permissions": ["offscreen", "storage"],
-  "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://huggingface.co/*",
+    "https://*.hf.co/*",
+    "https://*.huggingface.co/*"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -14,6 +20,15 @@
       "matches": ["https://x.com/*", "https://twitter.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "ort-wasm-simd-threaded.jsep.mjs",
+        "ort-wasm-simd-threaded.jsep.wasm"
+      ],
+      "matches": ["<all_urls>"]
     }
   ],
   "content_security_policy": {

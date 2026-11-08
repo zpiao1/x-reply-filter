@@ -72,13 +72,20 @@ function countMaskTokens(
 }
 
 export async function createTransformersWebGpuBackend(): Promise<EmbeddingBackend> {
-  const { AutoTokenizer, pipeline } = await import("@huggingface/transformers");
+  const { AutoModel, AutoTokenizer, env } = await import("@huggingface/transformers");
+  if (env.backends.onnx?.wasm) {
+    env.backends.onnx.wasm.wasmPaths =
+      typeof chrome !== "undefined" && chrome.runtime?.getURL
+        ? chrome.runtime.getURL("")
+        : "./";
+  }
+
   const hasWebGpu = typeof navigator !== "undefined" && "gpu" in navigator;
   const device = hasWebGpu ? "webgpu" : "wasm";
 
-  const [tokenizer, extractor] = await Promise.all([
+  const [tokenizer, model] = await Promise.all([
     AutoTokenizer.from_pretrained(MODEL_ID),
-    pipeline("feature-extraction", MODEL_ID, {
+    AutoModel.from_pretrained(MODEL_ID, {
       device,
       dtype: MODEL_DTYPE,
     }),
@@ -125,12 +132,16 @@ export async function createTransformersWebGpuBackend(): Promise<EmbeddingBacken
         contentTokenCounts.push(asTokenCount(contentTokens));
       }
 
-      const tensorOut = await extractor(promptList, {
-        pooling: "mean",
-        normalize: false,
-      });
+      const modelOut = (await model(tokenized)) as {
+        readonly sentence_embedding?: { readonly data: Float32Array; readonly dims: readonly number[] };
+        readonly last_hidden_state?: { readonly data: Float32Array; readonly dims: readonly number[] };
+      };
+      const tensorOut = modelOut.sentence_embedding ?? modelOut.last_hidden_state;
+      if (!tensorOut) {
+        throw new Error("EmbeddingGemma returned no sentence_embedding tensor");
+      }
 
-      const rawData = tensorOut.data as Float32Array;
+      const rawData = tensorOut.data;
       const outDims = tensorOut.dims;
       const hiddenDim = Number(outDims[outDims.length - 1] ?? RAW_EMBEDDING_DIM);
       const embeddings256 = truncateAndNormalizeBatch256(rawData, promptList.length, hiddenDim);
@@ -138,7 +149,7 @@ export async function createTransformersWebGpuBackend(): Promise<EmbeddingBacken
       return { embeddings256, contentTokenCounts };
     },
     async dispose(): Promise<void> {
-      await extractor.dispose();
+      await model.dispose();
     },
   };
 }
