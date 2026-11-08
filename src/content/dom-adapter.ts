@@ -175,6 +175,8 @@ function findControlMountContainer(article: Element): Element {
 
 export function formatFilterReasonBadge(reason: FilterReason): string {
   switch (reason.kind) {
+    case "known_bot_author":
+      return `Known bot (@${reason.authorId}, ${reason.spamCount}x)`;
     case "op_paraphrase":
       return `AI paraphrase (${Math.round(reason.similarityToOp * 100)}%)`;
     case "thread_clone":
@@ -189,6 +191,22 @@ export function formatFilterReasonBadge(reason: FilterReason): string {
     case "clean":
       return "Clean";
   }
+}
+
+export function formatDiagnosticsTooltip(verdict: VerdictRecord): string {
+  const d = verdict.diagnostics;
+  if (!d) {
+    return `reason=${verdict.reason.kind} | score=${verdict.score.toFixed(2)} | tokens=${verdict.tokenCount}`;
+  }
+  const priorSign = d.authorSpamPrior >= 0 ? "+" : "";
+  return [
+    `reason=${verdict.reason.kind}`,
+    `siamese=${Math.round(d.siameseProbability * 100)}%`,
+    `opSim=${d.opCosSim.toFixed(2)}`,
+    `cloneSim=${d.maxCloneSim.toFixed(2)}`,
+    `authorPrior=${priorSign}${d.authorSpamPrior.toFixed(2)} (${d.authorSpamCount} spam / ${d.authorHumanCount} human)`,
+    `tokens=${verdict.tokenCount}`,
+  ].join(" | ");
 }
 
 export interface ThreadDomSnapshot {
@@ -308,6 +326,23 @@ export class XThreadDomAdapter {
 
       article.setAttribute("data-xrf-state", targetState);
       article.setAttribute("data-xrf-reason", verdict.reason.kind);
+      article.setAttribute("data-xrf-score", verdict.score.toFixed(3));
+      article.setAttribute("data-xrf-tokens", String(verdict.tokenCount));
+      if (verdict.diagnostics) {
+        article.setAttribute(
+          "data-xrf-siamese",
+          verdict.diagnostics.siameseProbability.toFixed(3),
+        );
+        article.setAttribute("data-xrf-op-sim", verdict.diagnostics.opCosSim.toFixed(3));
+        article.setAttribute(
+          "data-xrf-clone-sim",
+          verdict.diagnostics.maxCloneSim.toFixed(3),
+        );
+        article.setAttribute(
+          "data-xrf-author-prior",
+          verdict.diagnostics.authorSpamPrior.toFixed(3),
+        );
+      }
 
       const mountTarget = findControlMountContainer(article);
       let bar = article.querySelector(".xrf-control-bar");
@@ -320,6 +355,7 @@ export class XThreadDomAdapter {
       }
 
       bar.setAttribute("data-xrf-bar-action", verdict.action);
+      bar.setAttribute("title", formatDiagnosticsTooltip(verdict));
       bar.textContent = "";
 
       if (verdict.action === "dim") {
@@ -352,6 +388,14 @@ export class XThreadDomAdapter {
         });
         bar.appendChild(humanBtn);
       } else {
+        const scoreHint = ownerDoc.createElement("span");
+        scoreHint.className = "xrf-score-hint";
+        const botPct = Math.round(
+          (verdict.diagnostics?.siameseProbability ?? verdict.score) * 100,
+        );
+        scoreHint.textContent = `Bot ${botPct}%`;
+        bar.appendChild(scoreHint);
+
         const spamBtn = ownerDoc.createElement("button");
         spamBtn.type = "button";
         spamBtn.className = "xrf-btn xrf-feedback-spam";

@@ -4,8 +4,11 @@ import {
   SEED_CORPUS,
   type SeedPrototype,
   createInitialClassifierWeights,
+  recordAuthorOutcome,
 } from "../domain/seeds.ts";
 import {
+  type AuthorId,
+  type AuthorStats,
   CLASSIFICATION_TASK_PREFIX,
   type CandidateTweet,
   type EmbeddedTweet,
@@ -16,6 +19,7 @@ import {
   type UnitVec256,
   asTokenCount,
   formatClassificationPrompt,
+  parseAuthorId,
   truncateAndNormalizeBatch256,
 } from "../domain/types.ts";
 import type { OffscreenRpcRequest, OffscreenRpcResponse } from "../shared/rpc.ts";
@@ -326,6 +330,27 @@ interface StoredWeightsPayload {
   readonly weights: Float32Array;
   readonly bias: number;
   readonly updateCount: number;
+  readonly authorStatsEntries?: ReadonlyArray<readonly [string, AuthorStats]>;
+}
+
+function deserializeAuthorStats(
+  entries: ReadonlyArray<readonly [string, AuthorStats]> | undefined,
+): Map<AuthorId, AuthorStats> {
+  const map = new Map<AuthorId, AuthorStats>();
+  if (!entries) {
+    return map;
+  }
+  for (const [rawId, stats] of entries) {
+    const id = parseAuthorId(rawId);
+    if (id !== null && stats && typeof stats.spamCount === "number") {
+      map.set(id, {
+        spamCount: stats.spamCount,
+        humanCount: stats.humanCount ?? 0,
+        autoFlagCount: stats.autoFlagCount ?? 0,
+      });
+    }
+  }
+  return map;
 }
 
 export class IndexedDbWeightStore {
@@ -378,6 +403,7 @@ export class IndexedDbWeightStore {
           bias: payload.bias,
           seedPrototypes: defaults.seedPrototypes,
           updateCount: payload.updateCount,
+          authorStats: deserializeAuthorStats(payload.authorStatsEntries),
         };
       } else {
         this.memoryFallback = defaults;
@@ -412,6 +438,7 @@ export class IndexedDbWeightStore {
           weights: weights.weights,
           bias: weights.bias,
           updateCount: weights.updateCount,
+          authorStatsEntries: Array.from(weights.authorStats.entries()),
         };
         const putReq = store.put(payload, WEIGHTS_KEY);
         putReq.onsuccess = () => resolve();
@@ -468,6 +495,18 @@ export class OffscreenFilterService {
         };
       }
 
+      if (req.kind === "get_diagnostics") {
+        const state = this.gpuHost.getState();
+        const weights = await this.weightStore.getWeights();
+        const summary = this.engine.getDiagnosticsSummary(weights);
+        return {
+          kind: "diagnostics_ok",
+          gpuStatus: state.status,
+          deviceEpoch: state.deviceEpoch,
+          summary,
+        };
+      }
+
       if (req.kind === "record_feedback") {
         const currentWeights = await this.weightStore.getWeights();
         const feedback = this.engine.applyUserFeedback(
@@ -480,6 +519,7 @@ export class OffscreenFilterService {
           return {
             kind: "record_feedback_ok",
             updatedVerdict: null,
+            retroactiveUpdates: [],
             updateCount: currentWeights.updateCount,
           };
         }
@@ -487,6 +527,7 @@ export class OffscreenFilterService {
         return {
           kind: "record_feedback_ok",
           updatedVerdict: feedback.updatedVerdict,
+          retroactiveUpdates: feedback.retroactiveUpdates,
           updateCount: feedback.nextWeights.updateCount,
         };
       }
@@ -510,8 +551,24 @@ export class OffscreenFilterService {
 
       await this.ensureLiveSeedPrototypes();
       const embedded = await this.gpuHost.embedCandidates(toEmbed);
-      const weights = await this.weightStore.getWeights();
+      let weights = await this.weightStore.getWeights();
       const fresh = this.engine.ingestEmbeddedBatch(req.threadId, embedded, weights);
+
+      let authorStatsChanged = false;
+      for (const v of fresh.verdicts) {
+        if (
+          v.authorId !== undefined &&
+          (v.reason.kind === "keyword_spam" ||
+            v.reason.kind === "thread_clone" ||
+            v.reason.kind === "op_paraphrase")
+        ) {
+          weights = recordAuthorOutcome(weights, v.authorId, "auto_flag");
+          authorStatsChanged = true;
+        }
+      }
+      if (authorStatsChanged) {
+        await this.weightStore.saveWeights(weights);
+      }
 
       return {
         kind: "evaluate_batch_ok",

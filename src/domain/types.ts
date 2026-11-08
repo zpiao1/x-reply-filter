@@ -28,6 +28,7 @@ export const OP_PARAPHRASE_MIN = 0.82 as const;
 export const EXACT_QUOTE_CEILING = 0.985 as const;
 export const THREAD_CLONE_MIN = 0.92 as const;
 export const SIAMESE_BOT_THRESHOLD = 0.65 as const;
+export const AUTHOR_KNOWN_BOT_MIN_SPAM = 2 as const;
 export const MAX_CACHED_THREADS = 16 as const;
 export const DEFAULT_SLAB_CAPACITY = 512 as const;
 export const OFFSCREEN_IDLE_TIMEOUT_MS = 600_000 as const;
@@ -35,6 +36,12 @@ export const SCROLL_DEBOUNCE_MS = 80 as const;
 export const CLASSIFICATION_TASK_PREFIX = "task: classification | query: " as const;
 
 export type SupportedLanguage = "en" | "zh" | "ja";
+
+export interface AuthorStats {
+  readonly spamCount: number;
+  readonly humanCount: number;
+  readonly autoFlagCount: number;
+}
 
 export interface DomSignals {
   readonly hasVerifiedBadge: boolean;
@@ -74,6 +81,7 @@ export type ThreadAnchorState =
       readonly authorId: AuthorId;
       readonly tokenCount: TokenCount;
       readonly embedding: UnitVec256;
+      readonly cjkCharRatio?: number | undefined;
     };
 
 export type FilterReason =
@@ -82,6 +90,12 @@ export type FilterReason =
       readonly kind: "short_human_exempt";
       readonly action: "keep";
       readonly tokenCount: TokenCount;
+    }
+  | {
+      readonly kind: "known_bot_author";
+      readonly action: "dim";
+      readonly authorId: AuthorId;
+      readonly spamCount: number;
     }
   | {
       readonly kind: "keyword_spam";
@@ -113,12 +127,24 @@ export type FilterReason =
       readonly label: "spam" | "human";
     };
 
+export interface VerdictDiagnostics {
+  readonly opCosSim: UnitCosine;
+  readonly maxCloneSim: UnitCosine;
+  readonly siameseProbability: Probability;
+  readonly authorSpamPrior: number;
+  readonly authorSpamCount: number;
+  readonly authorHumanCount: number;
+}
+
 export interface VerdictRecord {
   readonly tweetId: TweetId;
+  readonly authorId?: AuthorId | undefined;
+  readonly snippet?: string | undefined;
   readonly action: FilterReason["action"];
   readonly score: number;
   readonly tokenCount: TokenCount;
   readonly reason: FilterReason;
+  readonly diagnostics?: VerdictDiagnostics | undefined;
 }
 
 export interface ThresholdConfig {
@@ -129,6 +155,7 @@ export interface ThresholdConfig {
   readonly cloneCosineMin: UnitCosine;
   readonly siameseScoreThreshold: Probability;
   readonly passiveAggressiveC: number;
+  readonly authorKnownBotMinSpam: number;
 }
 
 export const DEFAULT_THRESHOLDS: ThresholdConfig = {
@@ -139,7 +166,18 @@ export const DEFAULT_THRESHOLDS: ThresholdConfig = {
   cloneCosineMin: THREAD_CLONE_MIN as UnitCosine,
   siameseScoreThreshold: SIAMESE_BOT_THRESHOLD as Probability,
   passiveAggressiveC: 0.5,
+  authorKnownBotMinSpam: AUTHOR_KNOWN_BOT_MIN_SPAM,
 };
+
+export function computeAuthorSpamPrior(stats: AuthorStats | undefined): number {
+  if (!stats) {
+    return 0;
+  }
+  const pos = stats.spamCount * 2.0 + stats.autoFlagCount * 0.5;
+  const neg = stats.humanCount * 2.0;
+  const denom = pos + neg + 2.0;
+  return (pos - neg) / denom;
+}
 
 const TWEET_ID_PATTERN = /^\d{1,32}$/;
 const STATUS_PATH_PATTERN = /\/status\/(\d{1,32})/;

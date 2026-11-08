@@ -1,4 +1,4 @@
-import type { BatchEvaluationResult } from "../domain/engine.ts";
+import type { BatchEvaluationResult, DiagnosticsSummary } from "../domain/engine.ts";
 import {
   type CandidateTweet,
   type DomSignals,
@@ -29,6 +29,10 @@ export type OffscreenRpcRequest =
   | {
       readonly kind: "get_health";
       readonly target?: "background" | "offscreen";
+    }
+  | {
+      readonly kind: "get_diagnostics";
+      readonly target?: "background" | "offscreen";
     };
 
 export type OffscreenRpcResponse =
@@ -39,6 +43,7 @@ export type OffscreenRpcResponse =
   | {
       readonly kind: "record_feedback_ok";
       readonly updatedVerdict: VerdictRecord | null;
+      readonly retroactiveUpdates?: ReadonlyArray<VerdictRecord> | undefined;
       readonly updateCount: number;
     }
   | {
@@ -47,11 +52,17 @@ export type OffscreenRpcResponse =
       readonly deviceEpoch: number;
     }
   | {
+      readonly kind: "diagnostics_ok";
+      readonly gpuStatus: GpuStatusTag;
+      readonly deviceEpoch: number;
+      readonly summary: DiagnosticsSummary;
+    }
+  | {
       readonly kind: "rpc_error";
       readonly message: string;
     };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+function isRecord(value: unknown): boolean {
   return typeof value === "object" && value !== null;
 }
 
@@ -59,24 +70,25 @@ function parseDomSignals(raw: unknown): DomSignals | null {
   if (!isRecord(raw)) {
     return null;
   }
+  const obj = raw as Record<string, unknown>;
   if (
-    typeof raw.hasVerifiedBadge !== "boolean" ||
-    typeof raw.hasMediaOrExternalLink !== "boolean" ||
-    typeof raw.endsWithBaitQuestion !== "boolean" ||
-    typeof raw.emojiToCharRatio !== "number" ||
-    typeof raw.cjkCharRatio !== "number" ||
-    (raw.matchedSpamKeyword !== null && typeof raw.matchedSpamKeyword !== "string")
+    typeof obj.hasVerifiedBadge !== "boolean" ||
+    typeof obj.hasMediaOrExternalLink !== "boolean" ||
+    typeof obj.endsWithBaitQuestion !== "boolean" ||
+    typeof obj.emojiToCharRatio !== "number" ||
+    typeof obj.cjkCharRatio !== "number" ||
+    (obj.matchedSpamKeyword !== null && typeof obj.matchedSpamKeyword !== "string")
   ) {
     return null;
   }
 
   return {
-    hasVerifiedBadge: raw.hasVerifiedBadge,
-    hasMediaOrExternalLink: raw.hasMediaOrExternalLink,
-    endsWithBaitQuestion: raw.endsWithBaitQuestion,
-    emojiToCharRatio: Math.max(0, Math.min(1, raw.emojiToCharRatio)),
-    cjkCharRatio: Math.max(0, Math.min(1, raw.cjkCharRatio)),
-    matchedSpamKeyword: raw.matchedSpamKeyword,
+    hasVerifiedBadge: obj.hasVerifiedBadge,
+    hasMediaOrExternalLink: obj.hasMediaOrExternalLink,
+    endsWithBaitQuestion: obj.endsWithBaitQuestion,
+    emojiToCharRatio: Math.max(0, Math.min(1, obj.emojiToCharRatio)),
+    cjkCharRatio: Math.max(0, Math.min(1, obj.cjkCharRatio)),
+    matchedSpamKeyword: obj.matchedSpamKeyword,
   };
 }
 
@@ -84,19 +96,20 @@ function parseCandidateTweet(raw: unknown): CandidateTweet | null {
   if (!isRecord(raw)) {
     return null;
   }
+  const obj = raw as Record<string, unknown>;
   if (
-    typeof raw.tweetId !== "string" ||
-    typeof raw.authorId !== "string" ||
-    typeof raw.rawText !== "string" ||
-    typeof raw.normalizedText !== "string" ||
-    typeof raw.isOp !== "boolean"
+    typeof obj.tweetId !== "string" ||
+    typeof obj.authorId !== "string" ||
+    typeof obj.rawText !== "string" ||
+    typeof obj.normalizedText !== "string" ||
+    typeof obj.isOp !== "boolean"
   ) {
     return null;
   }
 
-  const tweetId = parseTweetId(raw.tweetId);
-  const authorId = parseAuthorId(raw.authorId);
-  const domSignals = parseDomSignals(raw.domSignals);
+  const tweetId = parseTweetId(obj.tweetId);
+  const authorId = parseAuthorId(obj.authorId);
+  const domSignals = parseDomSignals(obj.domSignals);
   if (tweetId === null || authorId === null || domSignals === null) {
     return null;
   }
@@ -104,53 +117,63 @@ function parseCandidateTweet(raw: unknown): CandidateTweet | null {
   return {
     tweetId,
     authorId,
-    rawText: raw.rawText,
-    normalizedText: raw.normalizedText,
-    isOp: raw.isOp,
+    rawText: obj.rawText,
+    normalizedText: obj.normalizedText,
+    isOp: obj.isOp,
     domSignals,
   };
 }
 
 export function parseRpcRequest(raw: unknown): OffscreenRpcRequest | null {
-  if (!isRecord(raw) || typeof raw.kind !== "string") {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.kind !== "string") {
     return null;
   }
 
   const target =
-    raw.target === "background" || raw.target === "offscreen" ? raw.target : undefined;
+    obj.target === "background" || obj.target === "offscreen" ? obj.target : undefined;
 
-  if (raw.kind === "get_health") {
+  if (obj.kind === "get_health") {
     return target !== undefined ? { kind: "get_health", target } : { kind: "get_health" };
   }
 
-  if (raw.kind === "record_feedback") {
+  if (obj.kind === "get_diagnostics") {
+    return target !== undefined
+      ? { kind: "get_diagnostics", target }
+      : { kind: "get_diagnostics" };
+  }
+
+  if (obj.kind === "record_feedback") {
     if (
-      typeof raw.threadId !== "string" ||
-      typeof raw.tweetId !== "string" ||
-      (raw.label !== "spam" && raw.label !== "human")
+      typeof obj.threadId !== "string" ||
+      typeof obj.tweetId !== "string" ||
+      (obj.label !== "spam" && obj.label !== "human")
     ) {
       return null;
     }
-    const threadId = parseThreadId(raw.threadId);
-    const tweetId = parseTweetId(raw.tweetId);
+    const threadId = parseThreadId(obj.threadId);
+    const tweetId = parseTweetId(obj.tweetId);
     if (threadId === null || tweetId === null) {
       return null;
     }
     return target !== undefined
-      ? { kind: "record_feedback", threadId, tweetId, label: raw.label, target }
-      : { kind: "record_feedback", threadId, tweetId, label: raw.label };
+      ? { kind: "record_feedback", threadId, tweetId, label: obj.label, target }
+      : { kind: "record_feedback", threadId, tweetId, label: obj.label };
   }
 
-  if (raw.kind === "evaluate_batch") {
-    if (typeof raw.threadId !== "string" || !Array.isArray(raw.candidates)) {
+  if (obj.kind === "evaluate_batch") {
+    if (typeof obj.threadId !== "string" || !Array.isArray(obj.candidates)) {
       return null;
     }
-    const threadId = parseThreadId(raw.threadId);
+    const threadId = parseThreadId(obj.threadId);
     if (threadId === null) {
       return null;
     }
     const candidates: CandidateTweet[] = [];
-    for (const item of raw.candidates) {
+    for (const item of obj.candidates) {
       const parsed = parseCandidateTweet(item);
       if (parsed === null) {
         return null;

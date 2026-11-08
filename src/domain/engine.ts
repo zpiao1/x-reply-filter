@@ -1,9 +1,11 @@
 import {
   type OnlineClassifierWeights,
   detectDominantLanguage,
+  recordAuthorOutcome,
 } from "./seeds.ts";
 import {
   type AuthorId,
+  type AuthorStats,
   type CandidateTweet,
   DEFAULT_SLAB_CAPACITY,
   DEFAULT_THRESHOLDS,
@@ -24,9 +26,11 @@ import {
   type TweetId,
   type UnitCosine,
   type UnitVec256,
+  type VerdictDiagnostics,
   type VerdictRecord,
   asProbability,
   asUnitCosine,
+  computeAuthorSpamPrior,
 } from "./types.ts";
 
 export interface BatchEvaluationResult {
@@ -46,6 +50,8 @@ export interface ReplyEvaluationContext {
   readonly cloneClusterSize: number;
   readonly siameseProbability: Probability;
   readonly dominantLanguage: SupportedLanguage;
+  readonly authorStats: AuthorStats | undefined;
+  readonly authorSpamPrior: number;
 }
 
 export interface VerdictRule {
@@ -54,6 +60,20 @@ export interface VerdictRule {
 }
 
 export const VERDICT_RULE_TABLE: ReadonlyArray<VerdictRule> = [
+  {
+    id: "known_bot_author",
+    match: (ctx, cfg) =>
+      ctx.authorStats !== undefined &&
+      ctx.authorStats.spamCount >= cfg.authorKnownBotMinSpam &&
+      ctx.authorStats.spamCount > ctx.authorStats.humanCount * 2
+        ? {
+            kind: "known_bot_author",
+            action: "dim",
+            authorId: ctx.candidate.authorId,
+            spamCount: ctx.authorStats.spamCount,
+          }
+        : null,
+  },
   {
     id: "thread_clone",
     match: (ctx, cfg) =>
@@ -82,6 +102,7 @@ export const VERDICT_RULE_TABLE: ReadonlyArray<VerdictRule> = [
     id: "short_human_exempt",
     match: (ctx, cfg) =>
       ctx.tokenCount < cfg.minReplyTokens &&
+      ctx.authorSpamPrior <= 0 &&
       !(ctx.candidate.domSignals.hasVerifiedBadge && ctx.candidate.domSignals.emojiToCharRatio >= 0.8) &&
       ctx.siameseProbability < cfg.siameseScoreThreshold
         ? {
@@ -128,11 +149,31 @@ interface ThreadSlabState {
   readonly replyMatrix: Float32Array;
   readonly replyTweetIds: TweetId[];
   readonly replyAuthorIds: AuthorId[];
+  readonly replySnippets: string[];
   readonly replyTokenCounts: Uint16Array;
   readonly cloneClusterCounts: Uint16Array;
   readonly slotByTweetId: Map<TweetId, number>;
   readonly verdictsByTweetId: Map<TweetId, VerdictRecord>;
   readonly featuresByTweetId: Map<TweetId, SiameseFeatureVec>;
+}
+
+export interface AuthorReputationEntry {
+  readonly authorId: AuthorId;
+  readonly spamCount: number;
+  readonly humanCount: number;
+  readonly autoFlagCount: number;
+  readonly prior: number;
+}
+
+export interface DiagnosticsSummary {
+  readonly cachedThreadCount: number;
+  readonly totalScoredReplies: number;
+  readonly dimmedReplies: number;
+  readonly keptReplies: number;
+  readonly updateCount: number;
+  readonly countsByReason: Readonly<Record<string, number>>;
+  readonly topFlaggedAuthors: ReadonlyArray<AuthorReputationEntry>;
+  readonly recentVerdicts: ReadonlyArray<VerdictRecord>;
 }
 
 function createSlab(threadId: ThreadId, maxCapacity: number): ThreadSlabState {
@@ -144,6 +185,7 @@ function createSlab(threadId: ThreadId, maxCapacity: number): ThreadSlabState {
     replyMatrix: new Float32Array(maxCapacity * EMBEDDING_DIM),
     replyTweetIds: [],
     replyAuthorIds: [],
+    replySnippets: [],
     replyTokenCounts: new Uint16Array(maxCapacity),
     cloneClusterCounts: new Uint16Array(maxCapacity),
     slotByTweetId: new Map(),
@@ -226,6 +268,7 @@ export function scoreSiameseHead(
   replyVec: UnitVec256,
   rawText: string,
   classifier: OnlineClassifierWeights,
+  authorSpamPrior = 0,
 ): { readonly probability: Probability; readonly dominantLanguage: SupportedLanguage } {
   let linearMargin = classifier.bias;
   for (let i = 0; i < SIAMESE_TOTAL_DIM; i++) {
@@ -248,7 +291,8 @@ export function scoreSiameseHead(
 
   const prototypeMargin =
     bestPosSim >= 0 && bestNegSim >= 0 ? (bestPosSim - bestNegSim) * 1.5 : 0;
-  const logit = linearMargin + prototypeMargin;
+  const authorMargin = authorSpamPrior * 1.35;
+  const logit = linearMargin + prototypeMargin + authorMargin;
   const prob = 1 / (1 + Math.exp(-logit));
   const dominantLanguage = bestPosLang ?? detectDominantLanguage(rawText);
 
@@ -292,6 +336,7 @@ export function updateOnlineWeightsPassiveAggressive(
     bias: current.bias + step,
     seedPrototypes: current.seedPrototypes,
     updateCount: current.updateCount + 1,
+    authorStats: current.authorStats,
   };
 }
 
@@ -299,6 +344,16 @@ export function evaluateReplyRules(
   ctx: ReplyEvaluationContext,
   cfg: ThresholdConfig = DEFAULT_THRESHOLDS,
 ): VerdictRecord {
+  const diagnostics: VerdictDiagnostics = {
+    opCosSim: ctx.opCosSim,
+    maxCloneSim: ctx.maxCloneSim,
+    siameseProbability: ctx.siameseProbability,
+    authorSpamPrior: ctx.authorSpamPrior,
+    authorSpamCount: ctx.authorStats?.spamCount ?? 0,
+    authorHumanCount: ctx.authorStats?.humanCount ?? 0,
+  };
+  const snippet = ctx.candidate.rawText.slice(0, 80);
+
   for (const rule of VERDICT_RULE_TABLE) {
     const reason = rule.match(ctx, cfg);
     if (reason !== null) {
@@ -307,25 +362,31 @@ export function evaluateReplyRules(
           ? reason.similarityToPeer
           : reason.kind === "op_paraphrase"
             ? reason.similarityToOp
-            : reason.kind === "keyword_spam"
+            : reason.kind === "keyword_spam" || reason.kind === "known_bot_author"
               ? 1
               : ctx.siameseProbability;
       return {
         tweetId: ctx.candidate.tweetId,
+        authorId: ctx.candidate.authorId,
+        snippet,
         action: reason.action,
         score,
         tokenCount: ctx.tokenCount,
         reason,
+        diagnostics,
       };
     }
   }
 
   return {
     tweetId: ctx.candidate.tweetId,
+    authorId: ctx.candidate.authorId,
+    snippet,
     action: "keep",
     score: ctx.siameseProbability,
     tokenCount: ctx.tokenCount,
     reason: { kind: "clean", action: "keep" },
+    diagnostics,
   };
 }
 
@@ -372,6 +433,52 @@ export class ThreadFilterEngine {
 
   public getCachedThreadCount(): number {
     return this.slabs.size;
+  }
+
+  public getDiagnosticsSummary(classifier: OnlineClassifierWeights): DiagnosticsSummary {
+    let totalScoredReplies = 0;
+    let dimmedReplies = 0;
+    let keptReplies = 0;
+    const countsByReason: Record<string, number> = {};
+    const recentVerdicts: VerdictRecord[] = [];
+
+    for (const slab of this.slabs.values()) {
+      for (const verdict of slab.verdictsByTweetId.values()) {
+        totalScoredReplies += 1;
+        if (verdict.action === "dim") {
+          dimmedReplies += 1;
+        } else {
+          keptReplies += 1;
+        }
+        countsByReason[verdict.reason.kind] = (countsByReason[verdict.reason.kind] ?? 0) + 1;
+        recentVerdicts.push(verdict);
+      }
+    }
+
+    const topFlaggedAuthors: AuthorReputationEntry[] = [];
+    for (const [authorId, stats] of classifier.authorStats.entries()) {
+      if (stats.spamCount > 0 || stats.autoFlagCount > 0 || stats.humanCount > 0) {
+        topFlaggedAuthors.push({
+          authorId,
+          spamCount: stats.spamCount,
+          humanCount: stats.humanCount,
+          autoFlagCount: stats.autoFlagCount,
+          prior: computeAuthorSpamPrior(stats),
+        });
+      }
+    }
+    topFlaggedAuthors.sort((a, b) => b.spamCount - a.spamCount || b.prior - a.prior);
+
+    return {
+      cachedThreadCount: this.slabs.size,
+      totalScoredReplies,
+      dimmedReplies,
+      keptReplies,
+      updateCount: classifier.updateCount,
+      countsByReason,
+      topFlaggedAuthors: topFlaggedAuthors.slice(0, 15),
+      recentVerdicts: recentVerdicts.slice(-25).reverse(),
+    };
   }
 
   public filterUnseenCandidates(
@@ -438,6 +545,7 @@ export class ThreadFilterEngine {
           authorId: item.candidate.authorId,
           tokenCount: item.tokenCount,
           embedding: item.embedding,
+          cjkCharRatio: item.candidate.domSignals.cjkCharRatio,
         };
       }
     }
@@ -478,10 +586,9 @@ export class ThreadFilterEngine {
           const peerVerdict = slab.verdictsByTweetId.get(canonicalCloneTweetId);
           if (peerVerdict && peerVerdict.action === "keep") {
             const promotedVerdict: VerdictRecord = {
-              tweetId: canonicalCloneTweetId,
+              ...peerVerdict,
               action: "dim",
               score: maxSim,
-              tokenCount: peerVerdict.tokenCount,
               reason: {
                 kind: "thread_clone",
                 action: "dim",
@@ -502,6 +609,7 @@ export class ThreadFilterEngine {
         slab.replyMatrix.set(item.embedding, slot * EMBEDDING_DIM);
         slab.replyTweetIds[slot] = item.candidate.tweetId;
         slab.replyAuthorIds[slot] = item.candidate.authorId;
+        slab.replySnippets[slot] = item.candidate.rawText.slice(0, 80);
         slab.replyTokenCounts[slot] = item.tokenCount;
         slab.cloneClusterCounts[slot] = cloneClusterSize;
         slab.slotByTweetId.set(item.candidate.tweetId, slot);
@@ -519,11 +627,15 @@ export class ThreadFilterEngine {
       );
       slab.featuresByTweetId.set(item.candidate.tweetId, features);
 
+      const authorStats = classifier.authorStats.get(item.candidate.authorId);
+      const authorSpamPrior = computeAuthorSpamPrior(authorStats);
+
       const { probability, dominantLanguage } = scoreSiameseHead(
         features,
         item.embedding,
         item.candidate.rawText,
         classifier,
+        authorSpamPrior,
       );
 
       const verdict = evaluateReplyRules(
@@ -537,6 +649,8 @@ export class ThreadFilterEngine {
           cloneClusterSize,
           siameseProbability: probability,
           dominantLanguage,
+          authorStats,
+          authorSpamPrior,
         },
         this.thresholds,
       );
@@ -560,6 +674,7 @@ export class ThreadFilterEngine {
     currentWeights: OnlineClassifierWeights,
   ): {
     readonly updatedVerdict: VerdictRecord;
+    readonly retroactiveUpdates: ReadonlyArray<VerdictRecord>;
     readonly nextWeights: OnlineClassifierWeights;
   } | null {
     const slab = this.slabs.get(threadId);
@@ -573,27 +688,92 @@ export class ThreadFilterEngine {
       return null;
     }
 
+    const slot = slab.slotByTweetId.get(tweetId);
+    const authorId = slot !== undefined ? slab.replyAuthorIds[slot] : priorVerdict.authorId;
+
     const target: 1 | -1 = label === "spam" ? 1 : -1;
-    const nextWeights = updateOnlineWeightsPassiveAggressive(
+    let nextWeights = updateOnlineWeightsPassiveAggressive(
       currentWeights,
       features,
       target,
       this.thresholds.passiveAggressiveC,
     );
 
+    if (authorId !== undefined) {
+      nextWeights = recordAuthorOutcome(
+        nextWeights,
+        authorId,
+        label === "spam" ? "user_spam" : "user_human",
+      );
+    }
+
+    const updatedStats = authorId !== undefined ? nextWeights.authorStats.get(authorId) : undefined;
+    const updatedPrior = computeAuthorSpamPrior(updatedStats);
+
     const updatedVerdict: VerdictRecord = {
-      tweetId,
+      ...priorVerdict,
       action: label === "spam" ? "dim" : "keep",
       score: label === "spam" ? 1 : 0,
-      tokenCount: priorVerdict.tokenCount,
       reason: {
         kind: "user_override",
         action: label === "spam" ? "dim" : "keep",
         label,
       },
+      diagnostics: priorVerdict.diagnostics
+        ? {
+            ...priorVerdict.diagnostics,
+            authorSpamPrior: updatedPrior,
+            authorSpamCount: updatedStats?.spamCount ?? 0,
+            authorHumanCount: updatedStats?.humanCount ?? 0,
+          }
+        : undefined,
     };
 
     slab.verdictsByTweetId.set(tweetId, updatedVerdict);
-    return { updatedVerdict, nextWeights };
+
+    const retroactiveUpdates: VerdictRecord[] = [];
+    if (
+      label === "spam" &&
+      authorId !== undefined &&
+      updatedStats !== undefined &&
+      updatedStats.spamCount >= this.thresholds.authorKnownBotMinSpam &&
+      updatedStats.spamCount > updatedStats.humanCount * 2
+    ) {
+      for (let s = 0; s < slab.count; s++) {
+        const peerTweetId = slab.replyTweetIds[s];
+        if (peerTweetId === undefined || peerTweetId === tweetId) {
+          continue;
+        }
+        if (slab.replyAuthorIds[s] !== authorId) {
+          continue;
+        }
+        const peerVerdict = slab.verdictsByTweetId.get(peerTweetId);
+        if (peerVerdict && peerVerdict.action === "keep") {
+          const promoted: VerdictRecord = {
+            ...peerVerdict,
+            action: "dim",
+            score: 1,
+            reason: {
+              kind: "known_bot_author",
+              action: "dim",
+              authorId,
+              spamCount: updatedStats.spamCount,
+            },
+            diagnostics: peerVerdict.diagnostics
+              ? {
+                  ...peerVerdict.diagnostics,
+                  authorSpamPrior: updatedPrior,
+                  authorSpamCount: updatedStats.spamCount,
+                  authorHumanCount: updatedStats.humanCount,
+                }
+              : undefined,
+          };
+          slab.verdictsByTweetId.set(peerTweetId, promoted);
+          retroactiveUpdates.push(promoted);
+        }
+      }
+    }
+
+    return { updatedVerdict, retroactiveUpdates, nextWeights };
   }
 }

@@ -42,8 +42,7 @@ export async function runScrollPass(
     return;
   }
 
-  const allUpdates = [...response.result.verdicts, ...response.result.retroactiveUpdates];
-  adapter.applyVerdictsInPlace(doc, allUpdates, (tweetId, label) => {
+  const handleFeedback = (tweetId: Parameters<typeof adapter.applyVerdictsInPlace>[2] extends (id: infer T, l: "spam" | "human") => void ? T : never, label: "spam" | "human"): void => {
     void sendRpc({
       kind: "record_feedback",
       threadId: snapshot.threadId,
@@ -52,10 +51,17 @@ export async function runScrollPass(
       target: "background",
     }).then((feedbackRes) => {
       if (feedbackRes.kind === "record_feedback_ok" && feedbackRes.updatedVerdict !== null) {
-        adapter.applyVerdictsInPlace(doc, [feedbackRes.updatedVerdict], () => {});
+        const updates = [
+          feedbackRes.updatedVerdict,
+          ...(feedbackRes.retroactiveUpdates ?? []),
+        ];
+        adapter.applyVerdictsInPlace(doc, updates, handleFeedback);
       }
     });
-  });
+  };
+
+  const allUpdates = [...response.result.verdicts, ...response.result.retroactiveUpdates];
+  adapter.applyVerdictsInPlace(doc, allUpdates, handleFeedback);
 }
 
 export function mountThreadObserver(

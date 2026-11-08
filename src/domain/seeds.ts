@@ -1,4 +1,6 @@
 import {
+  type AuthorId,
+  type AuthorStats,
   type DomSignals,
   EMBEDDING_DIM,
   SIAMESE_RELATIONAL_DIM,
@@ -25,6 +27,7 @@ export interface OnlineClassifierWeights {
   readonly bias: number;
   readonly seedPrototypes: ReadonlyArray<SeedPrototype>;
   readonly updateCount: number;
+  readonly authorStats: ReadonlyMap<AuthorId, AuthorStats>;
 }
 
 const SPAM_PATTERNS: ReadonlyArray<{ readonly name: string; readonly regex: RegExp }> = [
@@ -148,6 +151,7 @@ export function createDeterministicSeedPrototypes(): ReadonlyArray<SeedPrototype
 
 export function createInitialClassifierWeights(
   seedPrototypes: ReadonlyArray<SeedPrototype> = createDeterministicSeedPrototypes(),
+  authorStats: ReadonlyMap<AuthorId, AuthorStats> = new Map(),
 ): OnlineClassifierWeights {
   const weights = new Float32Array(SIAMESE_TOTAL_DIM);
   weights[SIAMESE_RELATIONAL_DIM + 0] = 0.35;
@@ -162,5 +166,32 @@ export function createInitialClassifierWeights(
     bias: -0.35,
     seedPrototypes,
     updateCount: 0,
+    authorStats,
+  };
+}
+
+export function recordAuthorOutcome(
+  current: OnlineClassifierWeights,
+  authorId: AuthorId,
+  outcome: "user_spam" | "user_human" | "auto_flag",
+): OnlineClassifierWeights {
+  const nextMap = new Map(current.authorStats);
+  const prev = nextMap.get(authorId) ?? {
+    spamCount: 0,
+    humanCount: 0,
+    autoFlagCount: 0,
+  };
+
+  const updated: AuthorStats =
+    outcome === "user_spam"
+      ? { ...prev, spamCount: prev.spamCount + 1 }
+      : outcome === "user_human"
+        ? { ...prev, humanCount: prev.humanCount + 1 }
+        : { ...prev, autoFlagCount: prev.autoFlagCount + 1 };
+
+  nextMap.set(authorId, updated);
+  return {
+    ...current,
+    authorStats: nextMap,
   };
 }

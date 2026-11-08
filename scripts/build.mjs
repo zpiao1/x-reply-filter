@@ -42,8 +42,17 @@ await Promise.all([
     target: "es2022",
     platform: "browser",
   }),
+  build({
+    entryPoints: [path.join(rootDir, "src/popup/index.ts")],
+    outfile: path.join(distDir, "popup.js"),
+    bundle: true,
+    format: "esm",
+    target: "es2022",
+    platform: "browser",
+  }),
   copyFile(path.join(publicDir, "manifest.json"), path.join(distDir, "manifest.json")),
   copyFile(path.join(publicDir, "offscreen.html"), path.join(distDir, "offscreen.html")),
+  copyFile(path.join(publicDir, "popup.html"), path.join(distDir, "popup.html")),
   copyFile(
     path.join(transformersDistDir, "ort-wasm-simd-threaded.jsep.mjs"),
     path.join(distDir, "ort-wasm-simd-threaded.jsep.mjs"),

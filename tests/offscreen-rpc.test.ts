@@ -212,5 +212,18 @@ describe("WebGpuEmbeddingHost lifecycle and OffscreenFilterService routing", () 
     assert(feedbackRes !== null && feedbackRes.kind === "record_feedback_ok");
     assert.equal(feedbackRes.updatedVerdict?.action, "keep");
     assert.equal(feedbackRes.updateCount, 1);
+
+    const diagRes = await forwardRpcToOffscreen(
+      {
+        kind: "get_diagnostics",
+      },
+      mockOffscreenApi,
+      (req) => service.handleRequest(req),
+    );
+    assert(diagRes !== null && diagRes.kind === "diagnostics_ok");
+    assert.equal(diagRes.summary.totalScoredReplies, 1);
+    assert.equal(diagRes.summary.updateCount, 1);
+    assert.equal(diagRes.summary.topFlaggedAuthors.length, 1);
+    assert.equal(diagRes.summary.topFlaggedAuthors[0]?.authorId, "replier");
   });
 });

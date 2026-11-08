@@ -331,4 +331,86 @@ describe("ThreadFilterEngine 3-in-1 detection and edge-case invariants", () => {
 
     assert.equal(engine.getCachedThreadCount(), 2);
   });
+
+  it("tracks per-author spam reputation, boosts prior after 1 mark, and auto-dims + retroactively dims after 2 marks", () => {
+    const engine = new ThreadFilterEngine();
+    let weights = createInitialClassifierWeights();
+    const threadId = "6000" as ThreadId;
+
+    const op = makeCandidate("6000", "op_user", "Testing account-level spam memory across replies.", true);
+    const botReply1 = makeCandidate(
+      "6001",
+      "repeat_spammer",
+      "First reply from this account that looks superficially benign.",
+      false,
+    );
+    const botReply2 = makeCandidate(
+      "6002",
+      "repeat_spammer",
+      "Second reply from the same account in the same thread.",
+      false,
+    );
+    const botReply3 = makeCandidate(
+      "6003",
+      "repeat_spammer",
+      "Third reply arriving later in the same thread.",
+      false,
+    );
+    const botReply4 = makeCandidate(
+      "6004",
+      "repeat_spammer",
+      "ok",
+      false,
+    );
+
+    const res1 = engine.ingestEmbeddedBatch(
+      threadId,
+      [
+        { candidate: op, embedding: makeUnitVec(0), tokenCount: asTokenCount(10) },
+        { candidate: botReply1, embedding: makeUnitVec(50), tokenCount: asTokenCount(10) },
+        { candidate: botReply2, embedding: makeUnitVec(51), tokenCount: asTokenCount(10) },
+        { candidate: botReply3, embedding: makeUnitVec(52), tokenCount: asTokenCount(10) },
+      ],
+      weights,
+    );
+    assert.equal(res1.verdicts[0]?.action, "keep");
+    assert.equal(res1.verdicts[1]?.action, "keep");
+    assert.equal(res1.verdicts[2]?.action, "keep");
+
+    const fb1 = engine.applyUserFeedback(threadId, botReply1.tweetId, "spam", weights);
+    assert(fb1 !== null);
+    assert.equal(fb1.retroactiveUpdates.length, 0, "1 spam mark boosts prior but does not yet hard-ban");
+    weights = fb1.nextWeights;
+    assert.equal(weights.authorStats.get("repeat_spammer" as AuthorId)?.spamCount, 1);
+
+    const fb2 = engine.applyUserFeedback(threadId, botReply2.tweetId, "spam", weights);
+    assert(fb2 !== null);
+    weights = fb2.nextWeights;
+    assert.equal(weights.authorStats.get("repeat_spammer" as AuthorId)?.spamCount, 2);
+    assert.equal(
+      fb2.retroactiveUpdates.length,
+      1,
+      "2nd spam mark retroactively dims other visible replies from the same account",
+    );
+    assert.equal(fb2.retroactiveUpdates[0]?.tweetId, "6003");
+    assert.equal(fb2.retroactiveUpdates[0]?.reason.kind, "known_bot_author");
+
+    const res2 = engine.ingestEmbeddedBatch(
+      threadId,
+      [{ candidate: botReply4, embedding: makeUnitVec(53), tokenCount: asTokenCount(1) }],
+      weights,
+    );
+    assert.equal(res2.verdicts[0]?.action, "dim");
+    assert.equal(
+      res2.verdicts[0]?.reason.kind,
+      "known_bot_author",
+      "future replies from repeat_spammer (even 1-token replies) are automatically dimmed",
+    );
+
+    const diag = engine.getDiagnosticsSummary(weights);
+    assert.equal(diag.totalScoredReplies, 4);
+    assert.equal(diag.dimmedReplies, 4);
+    assert.equal(diag.topFlaggedAuthors[0]?.authorId, "repeat_spammer");
+    assert.equal(diag.topFlaggedAuthors[0]?.spamCount, 2);
+  });
 });
