@@ -81,7 +81,9 @@ export const VERDICT_RULE_TABLE: ReadonlyArray<VerdictRule> = [
   {
     id: "short_human_exempt",
     match: (ctx, cfg) =>
-      ctx.tokenCount < cfg.minReplyTokens
+      ctx.tokenCount < cfg.minReplyTokens &&
+      !(ctx.candidate.domSignals.hasVerifiedBadge && ctx.candidate.domSignals.emojiToCharRatio >= 0.8) &&
+      ctx.siameseProbability < cfg.siameseScoreThreshold
         ? {
             kind: "short_human_exempt",
             action: "keep",

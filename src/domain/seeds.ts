@@ -153,7 +153,7 @@ export function createInitialClassifierWeights(
   weights[SIAMESE_RELATIONAL_DIM + 0] = 0.35;
   weights[SIAMESE_RELATIONAL_DIM + 1] = 0.25;
   weights[SIAMESE_RELATIONAL_DIM + 2] = 0.95;
-  weights[SIAMESE_RELATIONAL_DIM + 3] = 0.6;
+  weights[SIAMESE_RELATIONAL_DIM + 3] = 0.85;
   weights[SIAMESE_RELATIONAL_DIM + 4] = 0.0;
   weights[SIAMESE_RELATIONAL_DIM + 5] = 1.8;
 

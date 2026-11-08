@@ -97,6 +97,7 @@ describe("ThreadFilterEngine 3-in-1 detection and edge-case invariants", () => {
     const shortZh = makeCandidate("1002", "zh_human", "太牛逼了", false, true);
     const shortEn = makeCandidate("1003", "en_human", "lol true", false, true);
     const shortSpamZh = makeCandidate("1004", "zh_spammer", "看主页置顶自取", false, true);
+    const verifiedEmojiZombie = makeCandidate("1005", "rankida600", "🙏🙏🙏🙏", false, true);
 
     const opVec = makeUnitVec(1);
     const result = engine.ingestEmbeddedBatch(
@@ -107,12 +108,13 @@ describe("ThreadFilterEngine 3-in-1 detection and edge-case invariants", () => {
         { candidate: shortZh, embedding: makeUnitVec(2), tokenCount: asTokenCount(3) },
         { candidate: shortEn, embedding: makeUnitVec(3), tokenCount: asTokenCount(2) },
         { candidate: shortSpamZh, embedding: makeUnitVec(4), tokenCount: asTokenCount(4) },
+        { candidate: verifiedEmojiZombie, embedding: makeUnitVec(5), tokenCount: asTokenCount(2) },
       ],
       weights,
     );
 
     assert.equal(result.anchorKind, "text_anchored");
-    assert.equal(result.verdicts.length, 4);
+    assert.equal(result.verdicts.length, 5);
     assert.equal(result.verdicts[0]?.action, "keep");
     assert.equal(result.verdicts[0]?.reason.kind, "short_human_exempt");
     assert.equal(result.verdicts[1]?.action, "keep");
@@ -121,6 +123,11 @@ describe("ThreadFilterEngine 3-in-1 detection and edge-case invariants", () => {
     assert.equal(result.verdicts[2]?.reason.kind, "short_human_exempt");
     assert.equal(result.verdicts[3]?.action, "dim");
     assert.equal(result.verdicts[3]?.reason.kind, "keyword_spam");
+    assert.equal(
+      result.verdicts[4]?.action,
+      "dim",
+      "verified emoji-only reply (🙏🙏🙏🙏) must be dimmed as bot, not exempted",
+    );
   });
 
   it("transitions to media_only anchor when OP has fewer than 5 tokens and zeroes relational features", () => {

@@ -17,6 +17,10 @@ const DISCOVER_MORE_HEADINGS: ReadonlyArray<RegExp> = [
   /^more posts$/i,
   /^发现更多$/,
   /^更多帖子$/,
+  /^探索更多$/,
+  /^更多貼文$/,
+  /^來自整個\s*X$/i,
+  /^来自整个\s*X$/i,
   /^さらに表示$/,
   /^他のポスト$/,
 ];

@@ -63,7 +63,7 @@ describe("XThreadDomAdapter extraction, cutoff, and zero-jitter dimming", () => 
   it("extracts thread tweets, ignores nested quote-tweet links, and stops at Discover more in EN/JA", () => {
     const adapter = new XThreadDomAdapter();
 
-    for (const heading of ["Discover more", "さらに表示", "发现更多"]) {
+    for (const heading of ["Discover more", "さらに表示", "发现更多", "探索更多"]) {
       const doc = buildMockXThreadDocument(heading);
       const snapshot = adapter.extractThreadSnapshot(doc, "/op_author/status/1000");
       assert(snapshot !== null);
