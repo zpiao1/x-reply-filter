@@ -61,7 +61,7 @@ export function renderDiagnosticsHtml(
 
   return `
     <h1>
-      <span>X Reply Filter</span>
+      <span class="brand"><img src="./icons/icon-32.png" alt="" /><span>X Reply Filter</span></span>
       <span class="status-pill">GPU: ${escapeHtml(gpuStatus)} (e${deviceEpoch})</span>
     </h1>
     <div class="grid">

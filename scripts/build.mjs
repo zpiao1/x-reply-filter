@@ -5,7 +5,9 @@ import { build } from "esbuild";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distDir = path.join(rootDir, "dist");
+const distIconsDir = path.join(distDir, "icons");
 const publicDir = path.join(rootDir, "public");
+const publicIconsDir = path.join(publicDir, "icons");
 const transformersDistDir = path.join(
   rootDir,
   "node_modules",
@@ -15,7 +17,7 @@ const transformersDistDir = path.join(
 );
 
 await rm(distDir, { recursive: true, force: true });
-await mkdir(distDir, { recursive: true });
+await mkdir(distIconsDir, { recursive: true });
 
 await Promise.all([
   build({
@@ -53,6 +55,10 @@ await Promise.all([
   copyFile(path.join(publicDir, "manifest.json"), path.join(distDir, "manifest.json")),
   copyFile(path.join(publicDir, "offscreen.html"), path.join(distDir, "offscreen.html")),
   copyFile(path.join(publicDir, "popup.html"), path.join(distDir, "popup.html")),
+  copyFile(path.join(publicIconsDir, "icon-16.png"), path.join(distIconsDir, "icon-16.png")),
+  copyFile(path.join(publicIconsDir, "icon-32.png"), path.join(distIconsDir, "icon-32.png")),
+  copyFile(path.join(publicIconsDir, "icon-48.png"), path.join(distIconsDir, "icon-48.png")),
+  copyFile(path.join(publicIconsDir, "icon-128.png"), path.join(distIconsDir, "icon-128.png")),
   copyFile(
     path.join(transformersDistDir, "ort-wasm-simd-threaded.jsep.mjs"),
     path.join(distDir, "ort-wasm-simd-threaded.jsep.mjs"),

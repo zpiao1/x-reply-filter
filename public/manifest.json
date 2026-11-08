@@ -3,6 +3,12 @@
   "name": "X Bot & AI Slop Reply Filter",
   "version": "0.1.0",
   "description": "Locally dims AI bot paraphrases, thread clones, and spam replies on X across English, Chinese, and Japanese using EmbeddingGemma-300M on WebGPU.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "permissions": ["offscreen", "storage", "scripting", "tabs"],
   "host_permissions": [
     "https://x.com/*",
@@ -17,7 +23,13 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "X Reply Filter Diagnostics"
+    "default_title": "X Reply Filter Diagnostics",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   },
   "content_scripts": [
     {
