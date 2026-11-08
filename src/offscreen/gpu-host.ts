@@ -221,9 +221,7 @@ export class WebGpuEmbeddingHost {
     const recoveryPromise = (async () => {
       try {
         await failedBackend.dispose();
-      } catch {
-        // Ignore disposal errors from a lost WebGPU device.
-      }
+      } catch {}
       try {
         const fresh = await this.backendFactory();
         this.state = {
@@ -409,9 +407,7 @@ export class IndexedDbWeightStore {
         putReq.onerror = () => reject(putReq.error);
       });
       db.close();
-    } catch {
-      // Retain updated weights in memoryFallback if IndexedDB write fails.
-    }
+    } catch {}
   }
 }
 

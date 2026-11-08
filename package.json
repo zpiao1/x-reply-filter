@@ -16,6 +16,7 @@
     "@types/chrome": "^0.0.313",
     "@types/node": "^22.13.0",
     "esbuild": "^0.25.0",
+    "linkedom": "^0.18.15",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   }
