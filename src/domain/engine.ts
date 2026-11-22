@@ -17,6 +17,7 @@ import {
   type CompactV2ScoreResult,
   getEffectiveV2Params,
   getPresetThresholds,
+  insertIntoReplayBuffer,
   parseFeedbackImport,
   scoreCompactV2,
   serializeFeedbackExport,
@@ -210,6 +211,7 @@ interface CachedTweetContext {
   readonly embedding: UnitVec256;
   readonly tokenCount: TokenCount;
   anchorSnapshot: ThreadAnchorState;
+  focalAuthorId?: AuthorId | undefined;
   maxCloneSim: UnitCosine;
   canonicalCloneTweetId: TweetId | null;
   canonicalTokenCount: number;
@@ -226,6 +228,7 @@ interface CachedTweetContext {
 interface ThreadSlabState {
   readonly threadId: ThreadId;
   anchor: ThreadAnchorState;
+  focalAuthorId?: AuthorId | undefined;
   readonly maxCapacity: number;
   count: number;
   readonly replyMatrix: Float32Array;
@@ -467,6 +470,9 @@ export function evaluateReplyRules(
 }
 
 // ================= Rule Table v2 (R0–R12 + Caps C1–C5 + #16/#17 R9 caveat) =================
+const BIO_SCAM_REPLY_CTA_RE =
+  /\b(dm\s+me|send\s+(?:me\s+)?a?\s*dm|check\s+my\s+(?:bio|pinned|profile)|link\s+in\s+(?:my\s+)?bio|pinned\s+tweet|join\s+(?:my|our|the)\s+(?:group|channel|telegram|discord|vip|signal)|telegram|whatsapp|t\.me\/|onlyfans)\b|(看主页|看主頁|点我头像|點我頭像|置顶|置頂|私信|电报|電報|進群|进群|加群|プロフ|固ツイ|LINE(追加|登録)?)/i;
+
 export interface EvaluateRulesV2Input {
   readonly candidate: CandidateTweet;
   readonly tokenCount: TokenCount;
@@ -479,6 +485,7 @@ export interface EvaluateRulesV2Input {
   readonly authorStats: AuthorStats | undefined;
   readonly settings: FilterSettings;
   readonly thresholds?: PresetThresholds | undefined;
+  readonly focalAuthorId?: AuthorId | undefined;
   readonly viewerAuthorId?: AuthorId | undefined;
   readonly userOverride?: "spam" | "human" | undefined;
   readonly nowMs?: number | undefined;
@@ -623,7 +630,10 @@ export function evaluateVerdictRulesV2(input: EvaluateRulesV2Input): VerdictReco
   if (candidate.isContextAncestor === true) {
     shields.push("context_ancestor");
   }
-  if (anchor.kind !== "unanchored" && candidate.authorId === anchor.authorId) {
+  if (
+    (anchor.kind !== "unanchored" && candidate.authorId === anchor.authorId) ||
+    (input.focalAuthorId !== undefined && candidate.authorId === input.focalAuthorId)
+  ) {
     shields.push("op_author");
   }
   if (meta?.following === true) {
@@ -688,12 +698,12 @@ export function evaluateVerdictRulesV2(input: EvaluateRulesV2Input): VerdictReco
       feat.matchedSpamKeyword,
     );
   }
+  // #33 MAJOR: bio_scam requires strong scam-only bio hit AND a link, explicit CTA, or keyword in reply text (never s_syco_open)
   if (
     (v[47] ?? 0) >= 1 &&
     ((v[56] ?? 0) > 0 ||
-      (v[15] ?? 0) > 0 ||
-      (v[14] ?? 0) > 0 ||
-      /\b(dm|link|bio|pinned|tg|telegram|whatsapp)\b/i.test(candidate.rawText)) &&
+      /https?:\/\/\S+/i.test(candidate.rawText) ||
+      BIO_SCAM_REPLY_CTA_RE.test(candidate.rawText)) &&
     meta?.following !== true
   ) {
     return makeVerdict(
@@ -782,8 +792,13 @@ export function evaluateVerdictRulesV2(input: EvaluateRulesV2Input): VerdictReco
     ruleEvidence = "media-only blue";
   }
   // R7: short_human_reaction (runs BEFORE R8 thread_clone to fix FP1!)
+  // #33 MAJOR: casual clause requires !s_syco_open && s_slop_lex === 0
   else if (
-    (feat.contentTokenCount < thr.sg || ((v[28] ?? 0) > 0 && feat.contentTokenCount <= 12)) &&
+    (feat.contentTokenCount < thr.sg ||
+      ((v[28] ?? 0) > 0 &&
+        feat.contentTokenCount <= 12 &&
+        (v[14] ?? 0) === 0 &&
+        (v[16] ?? 0) === 0)) &&
     !((v[37] ?? 0) >= 1 && (v[39] ?? 0) >= 1 && (v[28] ?? 0) === 0)
   ) {
     ruleId = "short_human_exempt";
@@ -843,16 +858,11 @@ export function evaluateVerdictRulesV2(input: EvaluateRulesV2Input): VerdictReco
     const r9bSoftHit =
       paraphraseBase && opCosSim >= thr.pc - 0.04 && novelty <= 0.9;
 
+    // #30 & #33 MAJOR: all dim rules (R9, R10) run BEFORE suspect fallbacks (R9b, R11)
     if (r9LowNovHit || r9SynonymHit) {
       ruleId = "op_paraphrase";
       tier = "dim";
       reason = { kind: "op_paraphrase", action: "dim", similarityToOp: opCosSim };
-      score = opCosSim;
-      ruleEvidence = `OP sim ${Math.round(opCosSim * 100)}%`;
-    } else if (r9bSoftHit) {
-      ruleId = "op_paraphrase_soft";
-      tier = "suspect";
-      reason = { kind: "op_paraphrase", action: "suspect", similarityToOp: opCosSim };
       score = opCosSim;
       ruleEvidence = `OP sim ${Math.round(opCosSim * 100)}%`;
     }
@@ -874,6 +884,14 @@ export function evaluateVerdictRulesV2(input: EvaluateRulesV2Input): VerdictReco
         opFallback: anchor.kind !== "text_anchored",
       };
       score = scoreResult.probability;
+    }
+    // R9b: soft OP paraphrase -> suspect
+    else if (r9bSoftHit) {
+      ruleId = "op_paraphrase_soft";
+      tier = "suspect";
+      reason = { kind: "op_paraphrase", action: "suspect", similarityToOp: opCosSim };
+      score = opCosSim;
+      ruleEvidence = `OP sim ${Math.round(opCosSim * 100)}%`;
     }
     // R11: model_suspect
     else if (scoreResult.probability >= thr.suspect || scoreResult.probability >= thr.dim) {
@@ -970,6 +988,11 @@ export class ThreadFilterEngine {
 
   public setSettings(next: FilterSettings): void {
     this.settings = next;
+  }
+
+  public setThreadFocalAuthor(threadId: ThreadId, focalAuthorId: AuthorId): void {
+    const slab = this.getOrCreateSlab(threadId);
+    slab.focalAuthorId = focalAuthorId;
   }
 
   private putFeatureCache(tweetId: TweetId, ctx: CachedTweetContext): void {
@@ -1086,10 +1109,10 @@ export class ThreadFilterEngine {
     }
     topFlaggedAuthors.sort((a, b) => b.spamCount - a.spamCount || b.prior - a.prior);
 
+    const reviewed = classifier.dimsReviewedCount ?? this.dimsReviewedCount;
+    const overridden = classifier.dimsOverriddenHumanCount ?? this.dimsOverriddenHumanCount;
     const livePrecisionEstimate =
-      this.dimsReviewedCount > 0
-        ? Math.max(0, 1 - this.dimsOverriddenHumanCount / this.dimsReviewedCount)
-        : null;
+      reviewed > 0 ? Math.max(0, 1 - overridden / reviewed) : null;
 
     return {
       cachedThreadCount: this.slabs.size,
@@ -1128,6 +1151,7 @@ export class ThreadFilterEngine {
         clusterSize: ctx.cloneClusterSize,
       },
       authorStats,
+      focalAuthorId: ctx.focalAuthorId,
       nowMs,
     });
     const scoreResult = scoreCompactV2(feat, classifier);
@@ -1142,6 +1166,7 @@ export class ThreadFilterEngine {
       cloneClusterSize: ctx.cloneClusterSize,
       authorStats,
       settings,
+      focalAuthorId: ctx.focalAuthorId,
       userOverride: ctx.userOverride,
       nowMs,
     });
@@ -1198,11 +1223,15 @@ export class ThreadFilterEngine {
     candidates: ReadonlyArray<CandidateTweet>,
     classifier?: OnlineClassifierWeights,
     settings: FilterSettings = this.settings,
+    focalAuthorId?: AuthorId | undefined,
   ): {
     readonly cached: ReadonlyArray<VerdictRecord>;
     readonly toEmbed: ReadonlyArray<CandidateTweet>;
   } {
     const slab = this.getOrCreateSlab(threadId);
+    if (focalAuthorId !== undefined) {
+      slab.focalAuthorId = focalAuthorId;
+    }
     const cached: VerdictRecord[] = [];
     const toEmbed: CandidateTweet[] = [];
     const seenInBatch = new Set<TweetId>();
@@ -1238,14 +1267,19 @@ export class ThreadFilterEngine {
       if (existingCtx !== undefined) {
         const metaEnriched =
           existingCtx.candidate.graphqlMeta == null && candidate.graphqlMeta != null;
+        const focalUpdated =
+          slab.focalAuthorId !== undefined && existingCtx.focalAuthorId !== slab.focalAuthorId;
         const revChanged =
           existingCtx.evaluatedSettingsRevision !== settings.revision ||
           (classifier !== undefined && existingCtx.evaluatedWeightsRevision !== weightsRev);
 
-        if ((metaEnriched || revChanged) && classifier !== undefined) {
+        if ((metaEnriched || focalUpdated || revChanged) && classifier !== undefined) {
           if (metaEnriched) {
             existingCtx.candidate = candidate;
             existingCtx.anchorSnapshot = slab.anchor;
+          }
+          if (focalUpdated) {
+            existingCtx.focalAuthorId = slab.focalAuthorId;
           }
           const refreshed = this.evaluateCachedContext(existingCtx, classifier, settings);
           slab.verdictsByTweetId.set(candidate.tweetId, refreshed);
@@ -1269,9 +1303,13 @@ export class ThreadFilterEngine {
     classifier: OnlineClassifierWeights,
     settings: FilterSettings = this.settings,
     nowMs: number = Date.now(),
+    focalAuthorId?: AuthorId | undefined,
   ): BatchEvaluationResult {
     this.settings = settings;
     const slab = this.getOrCreateSlab(threadId);
+    if (focalAuthorId !== undefined) {
+      slab.focalAuthorId = focalAuthorId;
+    }
     const verdicts: VerdictRecord[] = [];
     const retroactiveUpdates: VerdictRecord[] = [];
     const params = getEffectiveV2Params(classifier);
@@ -1320,7 +1358,8 @@ export class ThreadFilterEngine {
       }
 
       const priorCount = slab.count;
-      const anchorAuthorId = slab.anchor.kind !== "unanchored" ? slab.anchor.authorId : null;
+      const anchorAuthorId =
+        slab.anchor.kind !== "unanchored" ? slab.anchor.authorId : (slab.focalAuthorId ?? null);
 
       // Exclude shielded (followed / OP / ancestor) prior slots from clone matching
       const excludedSlots = new Set<number>();
@@ -1370,6 +1409,7 @@ export class ThreadFilterEngine {
         protoBank: params.protoBank,
         cloneCtx: { maxCloneSim: maxSim, clusterSize: cloneClusterSize },
         authorStats,
+        focalAuthorId: slab.focalAuthorId,
         nowMs,
       });
 
@@ -1387,10 +1427,14 @@ export class ThreadFilterEngine {
         authorStats,
         settings,
         thresholds: thr,
+        focalAuthorId: slab.focalAuthorId,
         nowMs,
       });
 
       // Retroactive clone promotion ONLY if this reply triggered thread_clone AND canonical passes guards
+      // #30 & #33 MAJOR:
+      //  (a) Persist peerCtx.canonicalCloneTweetId & canonicalTokenCount so re-evaluations never flip-flop
+      //  (b) Promote suspect peers as well (action !== "dim"), not just action === "keep"
       if (
         verdict.reason.kind === "thread_clone" &&
         verdict.action === "dim" &&
@@ -1406,7 +1450,7 @@ export class ThreadFilterEngine {
 
         if (
           peerVerdict &&
-          peerVerdict.action === "keep" &&
+          peerVerdict.action !== "dim" &&
           !peerShielded &&
           !peerShortExempt &&
           !peerOverridden &&
@@ -1424,7 +1468,15 @@ export class ThreadFilterEngine {
               : "keep"
             : "dim";
 
-          if (promotedTier !== "keep") {
+          peerCtx.canonicalCloneTweetId = item.candidate.tweetId;
+          peerCtx.canonicalTokenCount = feat.contentTokenCount;
+          peerCtx.maxCloneSim = maxSim;
+          peerCtx.cloneClusterSize = cloneClusterSize;
+
+          if (
+            promotedTier !== "keep" &&
+            (promotedTier !== peerVerdict.action || peerVerdict.reason.kind !== "thread_clone")
+          ) {
             const promotedVerdict: VerdictRecord = {
               ...peerVerdict,
               action: promotedTier,
@@ -1434,7 +1486,7 @@ export class ThreadFilterEngine {
                 kind: "thread_clone",
                 action: promotedTier,
                 similarityToPeer: maxSim,
-                canonicalTweetId: canonicalCloneTweetId,
+                canonicalTweetId: item.candidate.tweetId,
                 clusterSize: cloneClusterSize,
               },
               explanation: peerVerdict.explanation
@@ -1447,8 +1499,6 @@ export class ThreadFilterEngine {
             };
             slab.verdictsByTweetId.set(canonicalCloneTweetId, promotedVerdict);
             peerCtx.lastVerdict = promotedVerdict;
-            peerCtx.maxCloneSim = maxSim;
-            peerCtx.cloneClusterSize = cloneClusterSize;
             retroactiveUpdates.push(promotedVerdict);
           }
         }
@@ -1483,6 +1533,7 @@ export class ThreadFilterEngine {
         embedding: item.embedding,
         tokenCount: item.tokenCount,
         anchorSnapshot: slab.anchor,
+        focalAuthorId: slab.focalAuthorId,
         maxCloneSim: maxSim,
         canonicalCloneTweetId,
         canonicalTokenCount,
@@ -1528,13 +1579,19 @@ export class ThreadFilterEngine {
     const prevAuthorStats = currentWeights.authorStats.get(authorId);
     const prevReplayEntry = currentWeights.replayBuffer?.find((e) => e.tweetId === tweetId);
 
-    // Track live precision metrics on reviewed dims
+    // Track live precision metrics on reviewed dims (persisted on weights + mirrored in memory)
+    const prevReviewed = currentWeights.dimsReviewedCount ?? this.dimsReviewedCount;
+    const prevOverridden = currentWeights.dimsOverriddenHumanCount ?? this.dimsOverriddenHumanCount;
+    let nextReviewed = prevReviewed;
+    let nextOverridden = prevOverridden;
     if (priorVerdict.action === "dim" && priorVerdict.reason.kind !== "user_override") {
-      this.dimsReviewedCount += 1;
+      nextReviewed += 1;
       if (label === "human") {
-        this.dimsOverriddenHumanCount += 1;
+        nextOverridden += 1;
       }
     }
+    this.dimsReviewedCount = nextReviewed;
+    this.dimsOverriddenHumanCount = nextOverridden;
 
     let nextWeights = currentWeights;
     let rolledBack = false;
@@ -1599,6 +1656,8 @@ export class ThreadFilterEngine {
       prevLangBias: { ...prevParams.langBias },
       prevUpdateCount: currentWeights.updateCount,
       prevRollbackCount: currentWeights.rollbackCount ?? 0,
+      prevDimsReviewedCount: prevReviewed,
+      prevDimsOverriddenHumanCount: prevOverridden,
       prevVerdict: priorVerdict,
       tsMs: nowMs,
     };
@@ -1606,6 +1665,8 @@ export class ThreadFilterEngine {
     nextWeights = {
       ...nextWeights,
       undoHistory: nextUndo,
+      dimsReviewedCount: nextReviewed,
+      dimsOverriddenHumanCount: nextOverridden,
     };
 
     const updatedStats = nextWeights.authorStats.get(authorId);
@@ -1721,12 +1782,23 @@ export class ThreadFilterEngine {
       nextReplay = [...nextReplay, last.prevReplayEntry];
     }
 
+    const restoredReviewed =
+      last.prevDimsReviewedCount ?? currentWeights.dimsReviewedCount ?? this.dimsReviewedCount;
+    const restoredOverridden =
+      last.prevDimsOverriddenHumanCount ??
+      currentWeights.dimsOverriddenHumanCount ??
+      this.dimsOverriddenHumanCount;
+    this.dimsReviewedCount = restoredReviewed;
+    this.dimsOverriddenHumanCount = restoredOverridden;
+
     const nextWeights: OnlineClassifierWeights = {
       ...currentWeights,
       theta: new Float32Array(last.prevTheta),
       langBias: { ...last.prevLangBias },
       updateCount: last.prevUpdateCount,
       rollbackCount: last.prevRollbackCount,
+      dimsReviewedCount: restoredReviewed,
+      dimsOverriddenHumanCount: restoredOverridden,
       authorStats: nextAuthors,
       replayBuffer: nextReplay,
       undoHistory: remainingHistory,
@@ -1775,19 +1847,28 @@ export class ThreadFilterEngine {
       mergedAuthors.set(id, stats);
     }
 
+    // Merge imported replay entries into existing replayBuffer (deduping by tweetId, enforcing bucket/size caps)
+    let mergedReplay: FeedbackReplayEntry[] = [...(currentWeights.replayBuffer ?? [])];
+    for (const entry of parsed.replayBuffer) {
+      mergedReplay = insertIntoReplayBuffer(mergedReplay, entry);
+    }
+
     const baseFresh: OnlineClassifierWeights = {
       ...createInitialClassifierWeights(currentWeights.seedPrototypes, mergedAuthors),
       weightsRevision: currentWeights.weightsRevision ?? 1,
       rollbackCount: currentWeights.rollbackCount ?? 0,
+      dimsReviewedCount: currentWeights.dimsReviewedCount ?? this.dimsReviewedCount,
+      dimsOverriddenHumanCount:
+        currentWeights.dimsOverriddenHumanCount ?? this.dimsOverriddenHumanCount,
       recordedAutoFlagIds: currentWeights.recordedAutoFlagIds,
     };
 
-    const trained = trainFromReplayBuffer(baseFresh, parsed.replayBuffer, { nowMs });
+    const trained = trainFromReplayBuffer(baseFresh, mergedReplay, { nowMs });
     return {
       nextWeights: {
         ...trained.nextWeights,
         authorStats: mergedAuthors,
-        updateCount: parsed.replayBuffer.length,
+        updateCount: Math.max(currentWeights.updateCount, mergedReplay.length),
       },
       importedReplayCount: parsed.replayBuffer.length,
       importedAuthorCount: parsed.authorStats.size,
@@ -1804,6 +1885,8 @@ export class ThreadFilterEngine {
     const fresh = createInitialClassifierWeights(currentWeights.seedPrototypes, new Map());
     return {
       ...fresh,
+      dimsReviewedCount: 0,
+      dimsOverriddenHumanCount: 0,
       weightsRevision: (currentWeights.weightsRevision ?? 1) + 1,
     };
   }
@@ -1832,6 +1915,11 @@ export class ThreadFilterEngine {
           c === "C3_followed_by" ||
           c === "C4_unsupported_lang",
       );
+    // #33 minor: restrict Stage-2 bot promotion strictly to model_suspect and op_paraphrase_soft
+    // so Stage-2 never overrides Conservative or DOM-only (following=null) demotions.
+    const canPromoteWithStage2 =
+      exp !== undefined &&
+      (exp.ruleId === "model_suspect" || exp.ruleId === "op_paraphrase_soft");
 
     let nextTier: VerdictTier = current.action;
     let nextReason: FilterReason = current.reason;
@@ -1840,7 +1928,7 @@ export class ThreadFilterEngine {
     if (current.action === "suspect") {
       // Asymmetric safety policy from benchmarks/benchmark-report.md §6:
       // - human >= 0.85 clears suspect -> keep
-      // - bot >= 0.92 promotes suspect -> dim ONLY with >=1 corroborating family, p >= tau_suspect, and no C1-C4 caps
+      // - bot >= 0.92 promotes model_suspect/op_paraphrase_soft -> dim ONLY with >=1 corroborating family, p >= tau_suspect, and no C1-C4 caps
       if (stage2.verdict === "human" && stage2.confidence >= 0.85) {
         nextTier = "keep";
         nextReason = { kind: "clean", action: "keep" };
@@ -1848,6 +1936,7 @@ export class ThreadFilterEngine {
       } else if (
         stage2.verdict === "bot" &&
         stage2.confidence >= 0.92 &&
+        canPromoteWithStage2 &&
         !hasBlockingCap &&
         exp !== undefined &&
         exp.families.length >= 1 &&

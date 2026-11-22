@@ -200,6 +200,8 @@ export interface UndoRecord {
   readonly prevLangBias: Readonly<Record<LangBiasKey, number>>;
   readonly prevUpdateCount: number;
   readonly prevRollbackCount: number;
+  readonly prevDimsReviewedCount?: number | undefined;
+  readonly prevDimsOverriddenHumanCount?: number | undefined;
   readonly prevVerdict: VerdictRecord | undefined;
   readonly tsMs: number;
 }

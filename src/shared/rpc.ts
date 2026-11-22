@@ -1,5 +1,6 @@
 import type { BatchEvaluationResult, DiagnosticsSummary } from "../domain/engine.ts";
 import {
+  type AuthorId,
   type CandidateTweet,
   type DomSignals,
   type FilterSettings,
@@ -24,6 +25,7 @@ export type OffscreenRpcRequest =
       readonly kind: "evaluate_batch";
       readonly threadId: ThreadId;
       readonly candidates: ReadonlyArray<CandidateTweet>;
+      readonly focalAuthorId?: AuthorId | undefined;
       readonly target?: "background" | "offscreen";
     }
   | {
@@ -149,6 +151,9 @@ export type OffscreenRpcResponse =
 
 const MAX_DESCRIPTION_LEN = 512;
 const MAX_DISPLAY_NAME_LEN = 128;
+const MAX_TWEET_TEXT_LEN = 4000;
+const MAX_BATCH_CANDIDATES = 200;
+const MAX_SNIPPET_LEN = 160;
 const MAX_IMPORT_JSON_LEN = 2_000_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -346,7 +351,9 @@ function parseDomSignals(raw: unknown): DomSignals | null {
     typeof raw.hasMediaOrExternalLink !== "boolean" ||
     typeof raw.endsWithBaitQuestion !== "boolean" ||
     typeof raw.emojiToCharRatio !== "number" ||
+    !Number.isFinite(raw.emojiToCharRatio) ||
     typeof raw.cjkCharRatio !== "number" ||
+    !Number.isFinite(raw.cjkCharRatio) ||
     (raw.matchedSpamKeyword !== null && typeof raw.matchedSpamKeyword !== "string")
   ) {
     return null;
@@ -358,7 +365,8 @@ function parseDomSignals(raw: unknown): DomSignals | null {
     endsWithBaitQuestion: raw.endsWithBaitQuestion,
     emojiToCharRatio: Math.max(0, Math.min(1, raw.emojiToCharRatio)),
     cjkCharRatio: Math.max(0, Math.min(1, raw.cjkCharRatio)),
-    matchedSpamKeyword: raw.matchedSpamKeyword,
+    matchedSpamKeyword:
+      raw.matchedSpamKeyword !== null ? raw.matchedSpamKeyword.slice(0, 64) : null,
   };
 }
 
@@ -383,15 +391,12 @@ function parseCandidateTweet(raw: unknown): CandidateTweet | null {
     return null;
   }
 
+  // #33 MAJOR: Degrade malformed graphqlMeta (schema drift / NaN) to null instead of rejecting the candidate/batch
   let graphqlMeta: GraphqlTweetMeta | null | undefined;
   if (raw.graphqlMeta === null) {
     graphqlMeta = null;
   } else if (raw.graphqlMeta !== undefined) {
-    const parsedMeta = parseGraphqlTweetMeta(raw.graphqlMeta);
-    if (parsedMeta === null) {
-      return null;
-    }
-    graphqlMeta = parsedMeta;
+    graphqlMeta = parseGraphqlTweetMeta(raw.graphqlMeta);
   }
 
   if (raw.hasPrimaryMedia !== undefined && typeof raw.hasPrimaryMedia !== "boolean") {
@@ -407,17 +412,23 @@ function parseCandidateTweet(raw: unknown): CandidateTweet | null {
   let opFavoriteCount: number | null | undefined;
   if (raw.opFavoriteCount !== undefined) {
     const parsedLikes = parseNullableNonNegInt(raw.opFavoriteCount);
-    if (parsedLikes === undefined) {
-      return null;
-    }
-    opFavoriteCount = parsedLikes;
+    opFavoriteCount = parsedLikes === undefined ? null : parsedLikes;
   }
+
+  const rawText =
+    raw.rawText.length > MAX_TWEET_TEXT_LEN
+      ? raw.rawText.slice(0, MAX_TWEET_TEXT_LEN)
+      : raw.rawText;
+  const normalizedText =
+    raw.normalizedText.length > MAX_TWEET_TEXT_LEN
+      ? raw.normalizedText.slice(0, MAX_TWEET_TEXT_LEN)
+      : raw.normalizedText;
 
   return {
     tweetId,
     authorId,
-    rawText: raw.rawText,
-    normalizedText: raw.normalizedText,
+    rawText,
+    normalizedText,
     isOp: raw.isOp,
     domSignals,
     ...(graphqlMeta !== undefined ? { graphqlMeta } : {}),
@@ -521,17 +532,27 @@ export function parseRpcRequestV2(raw: unknown): OffscreenRpcRequestV2 | null {
     if (threadId === null) {
       return null;
     }
+    const focalAuthorId =
+      typeof raw.focalAuthorId === "string"
+        ? (parseAuthorId(raw.focalAuthorId) ?? undefined)
+        : undefined;
+    // #33 MAJOR: Cap candidate count and skip individual invalid candidates instead of rejecting the entire batch
+    const limit = Math.min(raw.candidates.length, MAX_BATCH_CANDIDATES);
     const candidates: CandidateTweet[] = [];
-    for (const item of raw.candidates) {
-      const parsed = parseCandidateTweet(item);
+    for (let i = 0; i < limit; i++) {
+      const parsed = parseCandidateTweet(raw.candidates[i]);
       if (parsed === null) {
-        return null;
+        continue;
       }
       candidates.push(parsed);
     }
-    return target !== undefined
-      ? { kind: "evaluate_batch", threadId, candidates, target }
-      : { kind: "evaluate_batch", threadId, candidates };
+    return {
+      kind: "evaluate_batch",
+      threadId,
+      candidates,
+      ...(focalAuthorId !== undefined ? { focalAuthorId } : {}),
+      ...(target !== undefined ? { target } : {}),
+    };
   }
 
   return null;
@@ -551,6 +572,36 @@ export function parseRpcRequest(raw: unknown): OffscreenRpcRequest | null {
     return parsed;
   }
   return null;
+}
+
+function isValidExplanationShape(raw: unknown): boolean {
+  if (!isRecord(raw)) return false;
+  if (
+    raw.schemaVersion !== 2 ||
+    (raw.tier !== "keep" && raw.tier !== "suspect" && raw.tier !== "dim") ||
+    typeof raw.ruleId !== "string" ||
+    typeof raw.probability !== "number" ||
+    !Number.isFinite(raw.probability) ||
+    typeof raw.logit !== "number" ||
+    !Number.isFinite(raw.logit) ||
+    !isRecord(raw.thresholds) ||
+    typeof raw.thresholds.dim !== "number" ||
+    !Number.isFinite(raw.thresholds.dim) ||
+    typeof raw.thresholds.suspect !== "number" ||
+    !Number.isFinite(raw.thresholds.suspect) ||
+    (raw.preset !== "conservative" && raw.preset !== "balanced" && raw.preset !== "strict") ||
+    !Array.isArray(raw.top) ||
+    !Array.isArray(raw.counter) ||
+    !Array.isArray(raw.families) ||
+    !Array.isArray(raw.shields) ||
+    !Array.isArray(raw.caps) ||
+    (raw.metaSource !== "graphql" && raw.metaSource !== "dom") ||
+    !isRecord(raw.lang) ||
+    typeof raw.lang.reply !== "string"
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export function parseStage2VerdictUpdate(raw: unknown): Stage2VerdictUpdateMessage | null {
@@ -574,19 +625,29 @@ export function parseStage2VerdictUpdate(raw: unknown): Stage2VerdictUpdateMessa
     v.tweetId !== tweetId ||
     (v.action !== "keep" && v.action !== "suspect" && v.action !== "dim") ||
     typeof v.score !== "number" ||
+    !Number.isFinite(v.score) ||
     typeof v.tokenCount !== "number" ||
+    !Number.isFinite(v.tokenCount) ||
+    v.tokenCount < 0 ||
     !isRecord(v.reason) ||
     typeof v.reason.kind !== "string"
   ) {
     return null;
   }
+  if (v.explanation !== undefined && !isValidExplanationShape(v.explanation)) {
+    return null;
+  }
+  const sanitizedVerdict =
+    typeof v.snippet === "string" && v.snippet.length > MAX_SNIPPET_LEN
+      ? { ...v, snippet: v.snippet.slice(0, MAX_SNIPPET_LEN) }
+      : v;
   const target =
     raw.target === "content" || raw.target === "background" ? raw.target : undefined;
   return {
     kind: "stage2_verdict_update",
     threadId,
     tweetId,
-    verdict: v as unknown as VerdictRecord,
+    verdict: sanitizedVerdict as unknown as VerdictRecord,
     ...(target !== undefined ? { target } : {}),
   };
 }

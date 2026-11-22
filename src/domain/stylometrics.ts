@@ -1,4 +1,5 @@
 import {
+  type AuthorId,
   type AuthorStats,
   COMPACT_V2_DIM,
   type CandidateTweet,
@@ -303,7 +304,7 @@ const CONTRAST_RES: ReadonlyArray<RegExp> = [
 ];
 
 const SYCO_OPEN_RES: ReadonlyArray<RegExp> = [
-  /^\W*(great (point|take|thread|post|breakdown|insight|perspective)s?|spot on|so true|this is (so )?(true|spot on|brilliant|insightful|gold)|absolutely( love)?|couldn't (agree more|have said it better)|well said|(you )?nailed it|love this|fascinating|interesting (take|perspective)|this!+|exactly( this)?|what a (great|brilliant|powerful|fascinating)|powerful (words|message)|such an? (important|thoughtful|insightful)|100% (agree|truth)|massive w|amazing update|wild stat|facts\b)/i,
+  /^\W*(great (point|take|thread|post|breakdown|insight|perspective)s?|spot on|so true|this is (so )?(true|spot on|brilliant|insightful|gold)|absolutely(?!\s+not\b)(?:\s+love)?|couldn't (agree more|have said it better)|well said|(you )?nailed it|love this|fascinating|interesting (take|perspective)|this!+|exactly( this)?|what a (great|brilliant|powerful|fascinating)|powerful (words|message)|such an? (important|thoughtful|insightful)|100% (agree|truth)|massive w|amazing update|wild stat|facts\b)/i,
   /^\W*(说得(太|非常)?(好|透彻|对)|太真实了|总结得(很|非常|太)?到位|非常(赞同|有洞察力|有价值|认同)|确实如此|太对了|深有同感|讲得透彻|这个观点(很|非常|太)|精辟)/,
   /^\W*(說得(太|非常)?(好|透徹|對)|太真實了|總結得(很|非常|太)?到位|非常(贊同|精闢|認同)|確實如此|太對了|太精闢了|深有同感|講得透徹|很棒的觀點|這個觀點|認同)/,
   /^\W*((本当|まさ)に(その通り|本質|これ)|おっしゃる通り|素晴らしい(発信|視点)?|(すごく|とても|めちゃくちゃ)?共感(しました|します)|勉強になります|非常に(興味深い|参考になります|有益な)|大切な(視点|ポイント)|これは神知見)/,
@@ -363,12 +364,54 @@ const LISTICLE_BULLET_RE = /(?:^|\n)\s*(?:\d+[.)]|[•\-–*]|[①②③④⑤]|
 const LISTICLE_PHRASE_RE =
   /(\b\d+\s+key takeaways\b|\bthree (things|reasons|takeaways)\b|首先.{1,40}其次|第一.{1,40}第二|三个核心重点|三個核心重點|まず.{1,40}次に)/i;
 
-// #13 micro-fix #1: bare EN `w` and `facts` excluded so unfollowed blue-check hype replies
-// ("Facts 💯🔥", "W take 🔥") aren't exempted as short_human_reaction.
-const CASUAL_EN_RE =
-  /\b(lol+|lmao+|lmfao|rofl|wtf|omg|bruh|fr|ngl|tbh|imo|idk|smh|based|ratio|l|real|yikes|oof|damn|nah|yep|kek|cope|mid|sus)\b/i;
-const CASUAL_CJK_RE =
-  /(哈{2,}|笑死|卧槽|臥槽|我靠|靠北|绝了|絕了|离谱|離譜|牛逼|草|6{2,}|2333*|h{3,}|啊这|好家伙|真的假的|真假|好扯|傻眼|蚌埠住了|破防了|确实|確實|无语|w{2,}|ｗ{2,}|ワロタ|わろた|それな|まじ(か|で)|マジ(か|で)|えぐい|草生え|ほんこれ|わかる|了解)/;
+// #13 micro-fix #1 + #33 audit fixes:
+// - Bare EN `w` and `facts` excluded
+// - Exclude ordinary phrases ("based on", "the real ...", "ratio of", "mid-"), "shhh", "www.example.com", "66%"
+// - CJK casual terms anchored to short / boundary / dominant casual usage
+const CASUAL_EN_CORE_RE =
+  /\b(lol+|lmao+|lmfao|rofl|wtf|omg|bruh|fr|ngl|tbh|imo|idk|smh|yikes|oof|damn|nah|yep|kek|cope|sus)\b/i;
+const CASUAL_EN_GUARDED_RE =
+  /(?:\bbased\b(?!\s+(?:on|in|out|upon|around)\b)|(?:^|\b(?:so|too|for)\s+)real(?:\s*[.!?\p{Extended_Pictographic}]*$|\s+af\b)|\bratio\b(?!\s+(?:of|to|between|is|was)\b)|\bmid\b(?!-|\s+(?:week|year|month|day|century|level|tier|range|size|sized|20\d\d|term|way|point|air|game|season))|\b(?:big|huge|common|rare|massive)\s+l\b|\btake\s+the\s+l\b|^\s*l\s*$)/iu;
+const CASUAL_WWW_RE = /(?<![a-z0-9.])(?:w{2,}|ｗ{2,})(?![a-z0-9.])/i;
+const CASUAL_HHH_RE = /(?:^|[\s!?.,])h{3,}(?:$|[\s!?.,])/i;
+const CASUAL_NUM_RE = /(?<![\d.,%$])(6{3,}|233+)(?![\d.,%])/;
+const CASUAL_CJK_TERM_GLOBAL_RE =
+  /(哈{2,}|笑死|卧槽|臥槽|我靠|靠北|绝了|絕了|离谱|離譜|牛逼|草|啊这|好家伙|真的假的|真假|好扯|傻眼|蚌埠住了|破防了|确实|確實|无语|ワロタ|わろた|それな|まじ(か|で)|マジ(か|で)|えぐい|草生え|ほんこれ|わかる|了解)/g;
+const CASUAL_CJK_BOUNDARY_RE =
+  /(?:^[\s\p{P}]*(哈{2,}|笑死|卧槽|臥槽|我靠|靠北|绝了|絕了|离谱|離譜|牛逼|草|啊这|好家伙|真的假的|真假|好扯|傻眼|蚌埠住了|破防了|确实|確實|无语|ワロタ|わろた|それな|まじ(か|で)|マジ(か|で)|えぐい|草生え|ほんこれ|わかる|了解)|(?:哈{2,}|笑死|卧槽|臥槽|我靠|靠北|绝了|絕了|离谱|離譜|牛逼|草|啊这|好家伙|真的假的|真假|好扯|傻眼|蚌埠住了|破防了|确实|確實|无语|ワロタ|わろた|それな|まじ(か|で)|マジ(か|で)|えぐい|草生え|ほんこれ|わかる|了解)[\s\p{P}\p{Extended_Pictographic}]*$)/u;
+
+function matchCasualSlang(rawText: string): string | null {
+  const stripped = normalizeTextForRegex(stripLeadingMentionsAndUrls(rawText));
+  if (stripped.length === 0) return null;
+
+  const enCore = CASUAL_EN_CORE_RE.exec(stripped);
+  if (enCore) return enCore[0];
+
+  const enGuarded = CASUAL_EN_GUARDED_RE.exec(stripped);
+  if (enGuarded) return enGuarded[0].trim();
+
+  const wwwMatch = CASUAL_WWW_RE.exec(stripped);
+  if (wwwMatch) return wwwMatch[0];
+
+  const hhhMatch = CASUAL_HHH_RE.exec(stripped);
+  if (hhhMatch) return hhhMatch[0].trim();
+
+  const numMatch = CASUAL_NUM_RE.exec(stripped);
+  if (numMatch) return numMatch[1] ?? numMatch[0];
+
+  CASUAL_CJK_TERM_GLOBAL_RE.lastIndex = 0;
+  const cjkMatches = stripped.match(CASUAL_CJK_TERM_GLOBAL_RE);
+  if (cjkMatches && cjkMatches.length > 0) {
+    const coreText = stripped.replace(/[\s\p{P}\p{Extended_Pictographic}]/gu, "");
+    const hitLen = cjkMatches.reduce((acc, m) => acc + Array.from(m).length, 0);
+    const totalLen = Math.max(1, Array.from(coreText).length);
+    // CJK casual terms must make up most of the reply (>=40%) OR sit at start/end of a short reply (<=10 core chars)
+    if (hitLen / totalLen >= 0.4 || (totalLen <= 10 && CASUAL_CJK_BOUNDARY_RE.test(stripped))) {
+      return cjkMatches[0]!;
+    }
+  }
+  return null;
+}
 
 const PROFANITY_RE =
   /(\b(fuck|fucking|shit|bullshit|asshole|bitch|crap|hell|bs)\b|卧槽|臥槽|他妈|他媽|靠北|傻逼|牛逼|クソ|くそ|ゴミ)/i;
@@ -379,10 +422,11 @@ const INFORMAL_EN_TYPO_RE =
 const FIRST_PERSON_RE =
   /(\b(i tried|i've been|i spent|i tested|i read|i watched|i saw|we ran|we tried|we saw|we bind|we're still|my (team|kid|car|cat|umbrella|wallet|solo queue|2080|bambino|coat)|learned that the hard way|last (week|month|year|tuesday))\b|(我(试|测|以前|去年|上个月|之前|们团队|们后来|们去年|家|阳台|钱包)|实测|上周|昨天|去年の|先週|うちも|うちの|手元の|実際に|私も|試してみ|使ってます))/i;
 
+// #33 audit fix: strong bio spam strictly scam-only (no benign artist/office-worker terms like 置顶/副業/福利/同城/兼职)
 const BIO_SPAM_STRONG_RE =
-  /(dm\s+(for|me)\s+(promo|collab|'scale')|airdrop|100x|onlyfans|signal group|free telegram|forex|(trading|crypto) mentor|whatsapp\s*\+?\d|t\.me\/|带单|空投|兼职|福利|同城|全国空降|代理招募|副業|稼げる|LINE(追加|登録)|固ツイ見て|飙股|飆股|免費進群|私信领|置顶|置頂)/i;
+  /(onlyfans|signal\s+group|free\s+telegram|whatsapp\s*\+?\d{5,}|t\.me\/[a-z0-9_]+|带单|飙股|飆股|免費進群|免费进群|全国空降|私信领|私信領|稼げる|LINE(追加|登録)|固ツイ見て)/i;
 const BIO_SPAM_WEAK_RE =
-  /(\bcrypto\b|\bnft\b|\bweb3\b|ai enthusiast|\bbuilder\b|daily frameworks|scale smarter|saas builder|startup ops|币圈|投资|個人品牌|AI出海|一人公司|仮想通貨|投資|AI活用|毎日発信)/i;
+  /(dm\s+(for|me)\s+(promo|collab|'scale')|\bairdrop\b|\b100x\b|\bforex\b|(trading|crypto)\s+mentor|\bcrypto\b|\bnft\b|\bweb3\b|ai enthusiast|\bbuilder\b|daily frameworks|scale smarter|saas builder|startup ops|置顶|置頂|福利|兼职|同城|代理招募|副業|币圈|投资|個人品牌|AI出海|一人公司|仮想通貨|投資|AI活用|毎日発信)/i;
 
 const NAME_SPAM_RE =
   /(\$[A-Z]{2,6}\b|\bweb3\b|\|\s*(ai|growth|saas|startup|7-figure|indie|tech)|\bdm\b|🚀|\bnft\b|副業|币圈|合作|置顶|置頂|免費進群|プロフ必読|億り人)/i;
@@ -634,6 +678,8 @@ export interface ThreadCloneContext {
 
 export interface CompactFeatureExtraction {
   readonly vector: CompactFeatureVec;
+  /** Bitmask (0 = observed, 1 = missing/imputed so scorer imputes at zHuman & excludes from familyLogits). */
+  readonly missingMask: Uint8Array;
   readonly replyLang: LangV2;
   readonly opLang: LangV2 | null;
   readonly contentTokenCount: number;
@@ -653,11 +699,13 @@ export function extractCompactFeaturesV2(args: {
   readonly protoBank: PrototypeBankV2;
   readonly cloneCtx: ThreadCloneContext;
   readonly authorStats?: AuthorStats | undefined;
+  readonly focalAuthorId?: AuthorId | undefined;
   readonly nowMs?: number | undefined;
 }): CompactFeatureExtraction {
-  const { candidate, replyVec, anchor, protoBank, cloneCtx, authorStats } = args;
+  const { candidate, replyVec, anchor, protoBank, cloneCtx, authorStats, focalAuthorId } = args;
   const nowMs = args.nowMs ?? Date.now();
   const vec = new Float32Array(COMPACT_V2_DIM);
+  const missingMask = new Uint8Array(COMPACT_V2_DIM);
   const evidence: Record<string, string> = {};
   const meta = candidate.graphqlMeta ?? null;
   const rawText = candidate.rawText.trim();
@@ -730,7 +778,8 @@ export function extractCompactFeaturesV2(args: {
   const residualWithinLimit = residualEnWords <= 8 && residualCjkGraphemes <= 14;
   const residualMatchesTemplate =
     residualText.length === 0 || SUMMON_QUERY_RES.some((r) => r.test(residualText));
-  const anchorAuthorId = anchor.kind !== "unanchored" ? anchor.authorId : null;
+  const anchorAuthorId =
+    anchor.kind !== "unanchored" ? anchor.authorId : (focalAuthorId ?? null);
   const isShieldedAuthor =
     (anchorAuthorId !== null && candidate.authorId === anchorAuthorId) ||
     meta?.following === true;
@@ -886,9 +935,10 @@ export function extractCompactFeaturesV2(args: {
   const punctChars = (rawText.match(/[\p{P}]/gu) ?? []).length;
   vec[27] = rawText.length > 0 ? Math.min(1, punctChars / gLen) : 0;
 
-  const casualMatch = CASUAL_EN_RE.exec(normText) ?? CASUAL_CJK_RE.exec(normText);
+  const hasSlopCadence = (vec[13] ?? 0) > 0 || (vec[15] ?? 0) > 0 || (vec[16] ?? 0) > 0;
+  const casualMatch = !hasSlopCadence ? matchCasualSlang(rawText) : null;
   vec[28] = casualMatch !== null ? 1 : 0;
-  if (casualMatch) evidence.s_casual = casualMatch[0].slice(0, 24);
+  if (casualMatch) evidence.s_casual = casualMatch.slice(0, 24);
 
   vec[29] = PROFANITY_RE.test(normText) ? 1 : 0;
 
@@ -919,7 +969,12 @@ export function extractCompactFeaturesV2(args: {
   vec[35] = hasSummonMention ? 1 : 0;
 
   // Account / GraphQL metadata features (36..50)
+  // #33 audit fix: mark missing/imputed meta features in missingMask so they impute at zHuman
+  // and contribute 0 to logit & familyLogits (preventing free "meta" corroboration).
   vec[36] = meta !== null ? 1 : 0;
+  if (meta === null) {
+    missingMask[36] = 1;
+  }
 
   const mBlue =
     meta !== null
@@ -936,10 +991,17 @@ export function extractCompactFeaturesV2(args: {
     meta !== null && (meta.verifiedType === "business" || meta.verifiedType === "government")
       ? 1
       : 0;
+  if (meta === null) missingMask[38] = 1;
+
   const mUnfollowed = meta !== null && meta.following === false ? 1 : 0;
   vec[39] = mUnfollowed;
+  if (meta === null || meta.following === null) missingMask[39] = 1;
+
   vec[40] = mBlue * mUnfollowed * (contentTokenCount <= 12 ? 1 : 0);
+  if (meta === null || meta.following === null) missingMask[40] = 1;
+
   vec[41] = meta !== null && meta.followedBy === true ? 1 : 0;
+  if (meta === null || meta.followedBy === null) missingMask[41] = 1;
 
   const refTs = meta?.tweetCreatedAtMs ?? nowMs;
   const ageDays =
@@ -947,22 +1009,30 @@ export function extractCompactFeaturesV2(args: {
       ? Math.max(1, (refTs - meta.authorCreatedAtMs) / (24 * 3600 * 1000))
       : null;
   vec[42] = ageDays !== null ? Math.log1p(ageDays) / Math.log1p(5000) : 0.5;
-  vec[43] =
-    meta?.followersCount !== null && meta?.followersCount !== undefined
-      ? Math.min(1, Math.log10(1 + Math.max(0, meta.followersCount)) / 7)
-      : 0.3;
+  if (ageDays === null) missingMask[42] = 1;
+
+  const hasFollowers = meta?.followersCount !== null && meta?.followersCount !== undefined;
+  vec[43] = hasFollowers
+    ? Math.min(1, Math.log10(1 + Math.max(0, meta!.followersCount!)) / 7)
+    : 0.3;
+  if (!hasFollowers) missingMask[43] = 1;
+
+  const hasFriends = meta?.friendsCount !== null && meta?.friendsCount !== undefined;
   vec[44] =
-    meta?.followersCount !== null &&
-    meta?.followersCount !== undefined &&
-    meta?.friendsCount !== null &&
-    meta?.friendsCount !== undefined
-      ? clamp(Math.log10((meta.friendsCount + 1) / (meta.followersCount + 1)), -3, 3) / 3
+    hasFollowers && hasFriends
+      ? clamp(Math.log10((meta!.friendsCount! + 1) / (meta!.followersCount! + 1)), -3, 3) / 3
       : 0;
+  if (!hasFollowers || !hasFriends) missingMask[44] = 1;
+
+  const hasStatuses = meta?.statusesCount !== null && meta?.statusesCount !== undefined;
   vec[45] =
-    ageDays !== null && meta?.statusesCount !== null && meta?.statusesCount !== undefined
-      ? Math.min(1, Math.log1p(meta.statusesCount / ageDays) / Math.log1p(500))
+    ageDays !== null && hasStatuses
+      ? Math.min(1, Math.log1p(meta!.statusesCount! / ageDays) / Math.log1p(500))
       : 0.3;
+  if (ageDays === null || !hasStatuses) missingMask[45] = 1;
+
   vec[46] = meta?.defaultProfileImage === true ? 1 : 0;
+  if (meta === null || meta.defaultProfileImage === null) missingMask[46] = 1;
 
   const bioText = normalizeTextForRegex(meta?.description ?? "");
   const bioSpam = BIO_SPAM_STRONG_RE.test(bioText)
@@ -971,11 +1041,13 @@ export function extractCompactFeaturesV2(args: {
       ? 0.5
       : 0;
   vec[47] = bioSpam;
+  if (meta === null || meta.description === null) missingMask[47] = 1;
   if (bioSpam > 0) evidence.m_bio_spam = bioText.slice(0, 32);
 
   const dispName = normalizeTextForRegex(meta?.displayName ?? "");
   const dispEmojis = splitGraphemes(dispName).filter((g) => EMOJI_GRAPHEME_RE.test(g)).length;
   vec[48] = dispEmojis >= 3 || NAME_SPAM_RE.test(dispName) ? 1 : 0;
+  if (meta === null || meta.displayName === null) missingMask[48] = 1;
   if (vec[48] > 0) evidence.m_name_spam = dispName.slice(0, 32);
 
   const authorFeatures = extractAuthorModelFeatures(candidate.authorId, authorStats, nowMs);
@@ -984,13 +1056,15 @@ export function extractCompactFeaturesV2(args: {
   const opLikes =
     candidate.opFavoriteCount ??
     (anchor.kind !== "unanchored" ? (anchor.favoriteCount ?? null) : null);
-  vec[50] =
+  const hasReplyLikesRel =
     meta?.favoriteCount !== null &&
     meta?.favoriteCount !== undefined &&
     opLikes !== null &&
-    opLikes !== undefined
-      ? Math.min(1, Math.log1p(meta.favoriteCount) / Math.log1p(1 + Math.max(0, opLikes)))
-      : 0;
+    opLikes !== undefined;
+  vec[50] = hasReplyLikesRel
+    ? Math.min(1, Math.log1p(meta!.favoriteCount!) / Math.log1p(1 + Math.max(0, opLikes!)))
+    : 0;
+  if (!hasReplyLikesRel) missingMask[50] = 1;
 
   // Author memory features (51..53)
   vec[51] = authorFeatures.spamRate;
@@ -1010,6 +1084,7 @@ export function extractCompactFeaturesV2(args: {
 
   return {
     vector: vec as CompactFeatureVec,
+    missingMask,
     replyLang,
     opLang,
     contentTokenCount,

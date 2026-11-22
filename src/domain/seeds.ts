@@ -62,6 +62,8 @@ export interface OnlineClassifierWeights {
   readonly weightsRevision?: number | undefined;
   readonly undoHistory?: ReadonlyArray<UndoRecord> | undefined;
   readonly recordedAutoFlagIds?: ReadonlySet<TweetId> | undefined;
+  readonly dimsReviewedCount?: number | undefined;
+  readonly dimsOverriddenHumanCount?: number | undefined;
 }
 
 export const SEED_CORPUS: ReadonlyArray<SeedExample> = CALIBRATED_WEIGHTS_V2.prototypes.map((p) => ({

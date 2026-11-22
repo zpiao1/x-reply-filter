@@ -41,6 +41,7 @@ import {
   type ThreadId,
   type TweetId,
   type UnitVec256,
+  asProbability,
   asTokenCount,
   getDecayedAutoFlags,
   parseAuthorId,
@@ -664,7 +665,7 @@ describe("Rule Table v2: shields, summons, blue-check short/media, clones, parap
     });
     assert(featSyn.vector[8]! > 0.5 && featSyn.vector[8]! <= 0.85, "synonym paraphrase novelty in (0.5, 0.85]");
     const scoreSyn = scoreCompactV2(featSyn, weights);
-    // Force single-family corroboration check directly to test R9b fallback cleanly
+    // Single-family corroboration + borderline probability -> falls through R9 and R10 to R9b suspect!
     const vSynOneFamily = evaluateVerdictRulesV2({
       candidate: synParaNeutral,
       tokenCount: asTokenCount(14),
@@ -672,6 +673,8 @@ describe("Rule Table v2: shields, summons, blue-check short/media, clones, parap
       feat: featSyn,
       scoreResult: {
         ...scoreSyn,
+        probability: asProbability(0.55),
+        corroboratingFamilies: ["embedding"],
         familyLogits: { ...scoreSyn.familyLogits, style: 0.1, meta: 0.1, embedding: 0.8 },
       },
       canonicalCloneTweetId: null,
@@ -682,6 +685,28 @@ describe("Rule Table v2: shields, summons, blue-check short/media, clones, parap
     });
     assert.equal(vSynOneFamily.action, "suspect", "0.5 < novelty <= 0.85 with only 1 family falls to R9b suspect");
     assert.equal(vSynOneFamily.explanation?.ruleId, "op_paraphrase_soft");
+
+    // #30/#33 MAJOR: When high-confidence model score (p >= tau_dim, >=2 families) also satisfies R9b,
+    // R10 siamese_bot (dim) MUST take precedence over R9b op_paraphrase_soft (suspect)!
+    const vR10BeatsR9b = evaluateVerdictRulesV2({
+      candidate: synParaNeutral,
+      tokenCount: asTokenCount(14),
+      anchor,
+      feat: featSyn,
+      scoreResult: {
+        ...scoreSyn,
+        probability: asProbability(0.88),
+        corroboratingFamilies: ["relational", "embedding"],
+        familyLogits: { ...scoreSyn.familyLogits, relational: 0.9, style: 0.1, meta: 0.1, embedding: 0.8 },
+      },
+      canonicalCloneTweetId: null,
+      canonicalTokenCount: 0,
+      cloneClusterSize: 1,
+      authorStats: undefined,
+      settings: DEFAULT_FILTER_SETTINGS,
+    });
+    assert.equal(vR10BeatsR9b.action, "dim", "R10 siamese_bot runs BEFORE R9b op_paraphrase_soft");
+    assert.equal(vR10BeatsR9b.reason.kind, "siamese_bot");
 
     // Same synonym paraphrase with 2 corroborating families -> R9 dim!
     const vSynTwoFamilies = evaluateVerdictRulesV2({
@@ -1039,16 +1064,28 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
       isOp: true,
     });
 
-    // Suspect item via DOM-only blue emoji (has >=1 corroborating family when scored, no C1-C4 caps)
-    const suspectNormal = makeCandidate(
+    // 1. Borderline model_suspect reply (p >= tau_suspect, < tau_dim or 1 family, no caps)
+    const suspectModel = makeCandidate(
       "7001",
-      "borderline_1",
-      "Spot on! Really resonates!",
-      { verified: true, graphqlMeta: null },
+      "borderline_model",
+      "Spot on! This really clarifies how modern software teams balance reliability against deployment speed.",
+      {
+        graphqlMeta: makeGqlMeta({
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+          followersCount: 600,
+          friendsCount: 300,
+          statusesCount: 800,
+          favoriteCount: 2,
+        }),
+      },
     );
-    const suspectToClear = makeCandidate(
+    // 2. DOM-only blue_short_praise suspect (following=null -> Stage-2 MUST NOT override DOM-only demotion to dim,
+    //    but Stage-2 human >= 0.85 CAN clear it to keep!)
+    const suspectDomBlue = makeCandidate(
       "7002",
-      "borderline_2",
+      "borderline_dom_blue",
       "Spot on! Really resonates!",
       { verified: true, graphqlMeta: null },
     );
@@ -1070,8 +1107,8 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
       threadId,
       [
         { candidate: op, embedding: makeUnitVec(1), tokenCount: asTokenCount(8) },
-        { candidate: suspectNormal, embedding: slopVec, tokenCount: asTokenCount(4) },
-        { candidate: suspectToClear, embedding: slopVec, tokenCount: asTokenCount(4) },
+        { candidate: suspectModel, embedding: slopVec, tokenCount: asTokenCount(14) },
+        { candidate: suspectDomBlue, embedding: slopVec, tokenCount: asTokenCount(4) },
         { candidate: cappedOrg, embedding: slopVec, tokenCount: asTokenCount(16) },
         { candidate: shieldedFollowed, embedding: slopVec, tokenCount: asTokenCount(2) },
       ],
@@ -1079,11 +1116,27 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
     );
 
     assert.equal(res.verdicts[0]?.action, "suspect");
+    assert.equal(res.verdicts[0]?.reason.kind, "model_suspect");
     assert.equal(res.verdicts[1]?.action, "suspect");
+    assert.equal(res.verdicts[1]?.reason.kind, "blue_short_praise");
     assert.equal(res.verdicts[2]?.action, "suspect");
     assert.equal(res.verdicts[3]?.action, "keep");
 
-    // 1. Human confidence >= 0.85 clears suspect -> keep
+    // 1. #33 Minor: DOM-only blue_short_praise (following=null) MUST NOT be promoted to dim by Stage-2
+    const domBlueBlocked = engine.applyStage2Verdict(threadId, "7002" as TweetId, {
+      provider: "chrome_gemini_nano",
+      verdict: "bot",
+      confidence: 0.99,
+      ms: 150,
+    });
+    assert(domBlueBlocked !== null && domBlueBlocked.changedTier === false);
+    assert.equal(
+      domBlueBlocked.updatedVerdict.action,
+      "suspect",
+      "Stage-2 bot promotion restricted to model_suspect/op_paraphrase_soft (never overrides DOM-only demotion)",
+    );
+
+    // 2. Human confidence >= 0.85 clears suspect -> keep
     const cleared = engine.applyStage2Verdict(threadId, "7002" as TweetId, {
       provider: "chrome_gemini_nano",
       verdict: "human",
@@ -1094,7 +1147,7 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
     assert.equal(cleared.updatedVerdict.action, "keep");
     assert.equal(cleared.updatedVerdict.explanation?.stage2?.provider, "chrome_gemini_nano");
 
-    // 2. Bot confidence 0.80 (< 0.92) must NOT promote suspect -> dim
+    // 3. Bot confidence 0.80 (< 0.92) must NOT promote model_suspect -> dim
     const lowConfBot = engine.applyStage2Verdict(threadId, "7001" as TweetId, {
       provider: "chrome_gemini_nano",
       verdict: "bot",
@@ -1104,7 +1157,7 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
     assert(lowConfBot !== null && lowConfBot.changedTier === false);
     assert.equal(lowConfBot.updatedVerdict.action, "suspect");
 
-    // 3. Bot confidence >= 0.92 promotes uncapped suspect with >=1 family -> dim
+    // 4. Bot confidence >= 0.92 promotes uncapped model_suspect with >=1 family -> dim
     const highConfBot = engine.applyStage2Verdict(threadId, "7001" as TweetId, {
       provider: "chrome_gemini_nano",
       verdict: "bot",
@@ -1113,8 +1166,9 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
     });
     assert(highConfBot !== null && highConfBot.changedTier === true);
     assert.equal(highConfBot.updatedVerdict.action, "dim");
+    assert.equal(highConfBot.updatedVerdict.reason.kind, "siamese_bot");
 
-    // 4. C1 org-verified cap blocks Stage-2 bot promotion even at confidence 0.99
+    // 5. C1 org-verified cap blocks Stage-2 bot promotion even at confidence 0.99
     const orgBlocked = engine.applyStage2Verdict(threadId, "7003" as TweetId, {
       provider: "chrome_gemini_nano",
       verdict: "bot",
@@ -1124,7 +1178,7 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
     assert(orgBlocked !== null && orgBlocked.changedTier === false);
     assert.equal(orgBlocked.updatedVerdict.action, "suspect");
 
-    // 5. R1 followed shield is NEVER touched by Stage-2
+    // 6. R1 followed shield is NEVER touched by Stage-2
     const shieldBlocked = engine.applyStage2Verdict(threadId, "7004" as TweetId, {
       provider: "chrome_gemini_nano",
       verdict: "bot",
@@ -1190,5 +1244,520 @@ describe("Online replay learner, rollback gate, undo/export/import/reset, and St
       target: "content",
     });
     assert(s2Msg !== null && s2Msg.kind === "stage2_verdict_update");
+  });
+});
+
+describe("Step-4 audit (#33/#30) defect regressions", () => {
+  it("MAJOR #1: spares normal artist/office-worker bios (置顶/副業) and drops s_syco_open from R3 bio_scam", () => {
+    const engine = new ThreadFilterEngine();
+    const weights = createInitialClassifierWeights();
+    const params = getEffectiveV2Params(weights);
+    const humanVec = getCalibratedHumanVec();
+    const threadId = "8100" as ThreadId;
+
+    const op = makeCandidate("8100", "art_op", "Sharing the final color pass on my illustration.", {
+      isOp: true,
+    });
+    // Exact repro #1 from #33
+    const zhArtist = makeCandidate(
+      "8101",
+      "zh_artist",
+      "说得好！这张的光影处理真的很厉害",
+      {
+        graphqlMeta: makeGqlMeta({
+          description: "插画师｜置顶是约稿信息",
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+        }),
+      },
+    );
+    // Exact repro #2 from #33
+    const jaWorker = makeCandidate(
+      "8102",
+      "ja_worker",
+      "素晴らしいですね、色使いが本当に好きです",
+      {
+        graphqlMeta: makeGqlMeta({
+          description: "会社員。副業でブログ書いてます",
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+        }),
+      },
+    );
+    // Strong scam bio + syco reply WITHOUT link or CTA must NOT trigger R3 bio_scam
+    const strongBioNoCta = makeCandidate(
+      "8103",
+      "scam_bio_no_cta",
+      "Spot on! Great breakdown.",
+      {
+        graphqlMeta: makeGqlMeta({
+          description: "Join my free telegram signal group t.me/vip_signals_99",
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+        }),
+      },
+    );
+    // Strong scam bio + explicit CTA in reply DOES trigger R3 bio_scam
+    const strongBioWithCta = makeCandidate(
+      "8104",
+      "scam_bio_cta",
+      "DM me for instant access to the VIP channel.",
+      {
+        graphqlMeta: makeGqlMeta({
+          description: "Join my free telegram signal group t.me/vip_signals_99",
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+        }),
+      },
+    );
+
+    const featArtist = extractCompactFeaturesV2({
+      candidate: zhArtist,
+      replyVec: humanVec,
+      anchor: { kind: "unanchored" },
+      protoBank: params.protoBank,
+      cloneCtx: { maxCloneSim: 0, clusterSize: 1 },
+    });
+    assert.equal(featArtist.vector[47], 0.5, "置顶 downgraded to weak bio spam (0.5)");
+
+    const featJa = extractCompactFeaturesV2({
+      candidate: jaWorker,
+      replyVec: humanVec,
+      anchor: { kind: "unanchored" },
+      protoBank: params.protoBank,
+      cloneCtx: { maxCloneSim: 0, clusterSize: 1 },
+    });
+    assert.equal(featJa.vector[47], 0.5, "副業 downgraded to weak bio spam (0.5)");
+
+    const res = engine.ingestEmbeddedBatch(
+      threadId,
+      [
+        { candidate: op, embedding: makeUnitVec(1), tokenCount: asTokenCount(10) },
+        { candidate: zhArtist, embedding: getCalibratedHumanVec(0), tokenCount: asTokenCount(9) },
+        { candidate: jaWorker, embedding: getCalibratedHumanVec(1), tokenCount: asTokenCount(11) },
+        { candidate: strongBioNoCta, embedding: getCalibratedHumanVec(2), tokenCount: asTokenCount(4) },
+        { candidate: strongBioWithCta, embedding: getCalibratedHumanVec(3), tokenCount: asTokenCount(8) },
+      ],
+      weights,
+    );
+
+    assert.equal(res.verdicts[0]?.action, "keep", "ZH artist with 置顶 bio kept");
+    assert.notEqual(res.verdicts[0]?.reason.kind, "bio_scam");
+    assert.equal(res.verdicts[1]?.action, "keep", "JA office worker with 副業 bio kept");
+    assert.notEqual(res.verdicts[1]?.reason.kind, "bio_scam");
+    assert.notEqual(
+      res.verdicts[2]?.reason.kind,
+      "bio_scam",
+      "s_syco_open alone no longer triggers R3 bio_scam",
+    );
+    assert.equal(res.verdicts[3]?.action, "dim");
+    assert.equal(res.verdicts[3]?.reason.kind, "bio_scam");
+  });
+
+  it("MAJOR #2 & Minor #2: anchors s_casual, enforces R7 !syco && slop_lex==0, and excludes 'Absolutely not'", () => {
+    const weights = createInitialClassifierWeights();
+    const params = getEffectiveV2Params(weights);
+    const vec = makeUnitVec(5);
+    const extract = (text: string, opts?: { verified?: boolean; meta?: GraphqlTweetMeta | null }) =>
+      extractCompactFeaturesV2({
+        candidate: makeCandidate("8201", "tester", text, {
+          verified: opts?.verified ?? false,
+          graphqlMeta: opts?.meta ?? makeGqlMeta(),
+        }),
+        replyVec: vec,
+        anchor: { kind: "unanchored" },
+        protoBank: params.protoBank,
+        cloneCtx: { maxCloneSim: 0, clusterSize: 1 },
+      });
+
+    // All #33 false-positive repros must have s_casual === 0
+    for (const bad of [
+      "Based on the data, Q3 margins compressed by 4 points.",
+      "The real question is whether enterprise demand holds.",
+      "Check www.example.com for the full specification.",
+      "shhh don't spoil the ending yet",
+      "Huge 66% upside 🚀🔥",
+      "确实，这个观点非常有洞察力，值得深思",
+      "A ratio of 3:1 is typical for mid-tier accounts.",
+    ]) {
+      assert.equal(extract(bad).vector[28], 0, `s_casual must be 0 for: ${bad}`);
+    }
+
+    // Genuine casual reactions STILL match s_casual === 1
+    for (const good of ["lol", "草", "666", "23333", "hhh", "まじかよww", "for real!", "based"]) {
+      assert.equal(extract(good).vector[28], 1, `s_casual must be 1 for: ${good}`);
+    }
+
+    // Minor #2: "Absolutely not, that's wrong" must NOT trigger s_syco_open
+    assert.equal(extract("Absolutely not, that's completely wrong.").vector[14], 0);
+    assert.equal(extract("Absolutely love this breakdown!").vector[14], 1);
+
+    // Blue unfollowed "Huge 66% upside 🚀🔥" must NOT be exempted by R7
+    const engine = new ThreadFilterEngine();
+    const blue66 = makeCandidate("8202", "reply_guy_66", "Huge 66% upside 🚀🔥", {
+      verified: true,
+      graphqlMeta: makeGqlMeta({ isBlueVerified: true, verifiedType: "blue", following: false }),
+    });
+    const zhSlop = makeCandidate(
+      "8203",
+      "zh_llm_bot",
+      "确实，这个观点非常有洞察力，值得深思",
+      {
+        verified: true,
+        graphqlMeta: makeGqlMeta({ isBlueVerified: true, verifiedType: "blue", following: false }),
+      },
+    );
+    const batch = engine.ingestEmbeddedBatch(
+      "8200" as ThreadId,
+      [
+        { candidate: blue66, embedding: getCalibratedSlopVec(), tokenCount: asTokenCount(4) },
+        { candidate: zhSlop, embedding: getCalibratedSlopVec(), tokenCount: asTokenCount(9) },
+      ],
+      weights,
+    );
+    assert.notEqual(batch.verdicts[0]?.reason.kind, "short_human_exempt");
+    assert.equal(batch.verdicts[0]?.action, "dim");
+    assert.notEqual(batch.verdicts[1]?.reason.kind, "short_human_exempt");
+    assert.equal(batch.verdicts[1]?.action, "dim");
+  });
+
+  it("MAJOR #3: makes m_reply_likes_rel shield-only and imputes missing meta at zHuman with 0 familyLogits", () => {
+    const weights = createInitialClassifierWeights();
+    const params = getEffectiveV2Params(weights);
+    const humanVec = getCalibratedHumanVec();
+
+    // 1. Fresh reply with 0 likes against 1000-like OP -> m_reply_likes_rel contrib MUST be 0 (never +0.70!)
+    const freshZeroLikes = makeCandidate(
+      "8301",
+      "fresh_human",
+      "We saw the exact same latency spike in our staging cluster yesterday.",
+      {
+        graphqlMeta: makeGqlMeta({
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+          followersCount: 800,
+          friendsCount: 400,
+          statusesCount: 1500,
+          favoriteCount: 0,
+        }),
+        opFavoriteCount: 1000,
+      },
+    );
+    const featFresh = extractCompactFeaturesV2({
+      candidate: freshZeroLikes,
+      replyVec: humanVec,
+      anchor: { kind: "unanchored" },
+      protoBank: params.protoBank,
+      cloneCtx: { maxCloneSim: 0, clusterSize: 1 },
+    });
+    const scoreFresh = scoreCompactV2(featFresh, weights);
+    assert(
+      !scoreFresh.top.some((c) => c.id === "m_reply_likes_rel"),
+      "0-like fresh reply never receives positive bot contribution from m_reply_likes_rel",
+    );
+    assert(
+      !scoreFresh.corroboratingFamilies.includes("meta"),
+      "0-like fresh reply does not grant free 'meta' corroboration",
+    );
+
+    // Exact additivity still holds after shield-only clamp!
+    const zHuman = CALIBRATED_WEIGHTS_V2.zHuman;
+    const mu = CALIBRATED_WEIGHTS_V2.mu;
+    const sigma = CALIBRATED_WEIGHTS_V2.sigma;
+    let sumFresh = 0;
+    for (let j = 0; j < COMPACT_V2_DIM; j++) {
+      if (j === 4) {
+        sumFresh +=
+          CALIBRATED_WEIGHTS_V2.fixedCoefs.protoMargin *
+          ((featFresh.vector[4] ?? 0) - ((mu[4] ?? 0) + (zHuman[4] ?? 0) * (sigma[4] ?? 1)));
+      } else if (j === 5) {
+        sumFresh +=
+          CALIBRATED_WEIGHTS_V2.fixedCoefs.generic *
+          ((featFresh.vector[5] ?? 0) - ((mu[5] ?? 0) + (zHuman[5] ?? 0) * (sigma[5] ?? 1)));
+      } else {
+        sumFresh += (weights.theta![j] ?? 0) * ((scoreFresh.z[j] ?? 0) - (zHuman[j] ?? 0));
+      }
+    }
+    assert(
+      Math.abs(scoreFresh.baseHumanLogit + sumFresh - scoreFresh.logit) < 1e-4,
+      "exact additivity preserved under shield-only m_reply_likes_rel clamp",
+    );
+
+    // 2. High-like reply (500 likes vs 1000 OP) -> negative shield contribution!
+    const highLikes = makeCandidate("8302", "liked_human", freshZeroLikes.rawText, {
+      graphqlMeta: makeGqlMeta({ favoriteCount: 500 }),
+      opFavoriteCount: 1000,
+    });
+    const featLiked = extractCompactFeaturesV2({
+      candidate: highLikes,
+      replyVec: humanVec,
+      anchor: { kind: "unanchored" },
+      protoBank: params.protoBank,
+      cloneCtx: { maxCloneSim: 0, clusterSize: 1 },
+    });
+    const scoreLiked = scoreCompactV2(featLiked, weights);
+    assert(
+      scoreLiked.counter.some((c) => c.id === "m_reply_likes_rel" && c.contribution < -0.5),
+      "high-like reply keeps negative human-shield contribution from m_reply_likes_rel",
+    );
+
+    // 3. DOM-only reply (graphqlMeta === null, unverified) -> missing meta imputed at zHuman, 0 free meta family!
+    const domOnly = makeCandidate("8303", "dom_human", freshZeroLikes.rawText, {
+      graphqlMeta: null,
+    });
+    const featDom = extractCompactFeaturesV2({
+      candidate: domOnly,
+      replyVec: humanVec,
+      anchor: { kind: "unanchored" },
+      protoBank: params.protoBank,
+      cloneCtx: { maxCloneSim: 0, clusterSize: 1 },
+    });
+    assert.equal(featDom.missingMask[36], 1, "m_meta_present marked missing in DOM-only mode");
+    assert.equal(featDom.missingMask[50], 1, "m_reply_likes_rel marked missing in DOM-only mode");
+    const scoreDom = scoreCompactV2(featDom, weights);
+    assert(
+      scoreDom.familyLogits.meta <= 0,
+      `DOM-only unverified reply must not get positive meta logit (got ${scoreDom.familyLogits.meta})`,
+    );
+    assert(!scoreDom.top.some((c) => c.id === "m_meta_present"));
+  });
+
+  it("MAJOR #5: retroactively promotes suspect clone peers and persists across reevaluateThread without flip-flopping", () => {
+    const engine = new ThreadFilterEngine();
+    const weights = createInitialClassifierWeights();
+    const threadId = "8400" as ThreadId;
+    const slopVec = getCalibratedSlopVec();
+    const op = makeCandidate("8400", "op_user", "Launching our open-source local inference demo.", {
+      isOp: true,
+    });
+
+    // First zombie starts as model_suspect (borderline probability, single corroborating family)
+    const zombieA = makeCandidate(
+      "8401",
+      "clone_bot_a",
+      "Spot on! This really clarifies how modern software teams balance reliability against deployment speed.",
+      {
+        graphqlMeta: makeGqlMeta({
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+          followersCount: 600,
+          friendsCount: 300,
+          statusesCount: 800,
+          favoriteCount: 2,
+        }),
+      },
+    );
+    const zombieB = makeCandidate(
+      "8402",
+      "clone_bot_b",
+      "Spot on! This really clarifies how modern software teams balance reliability against deployment speed.",
+      {
+        graphqlMeta: makeGqlMeta({
+          isBlueVerified: false,
+          verifiedType: "none",
+          following: false,
+          followersCount: 600,
+          friendsCount: 300,
+          statusesCount: 800,
+          favoriteCount: 2,
+        }),
+      },
+    );
+
+    const b1 = engine.ingestEmbeddedBatch(
+      threadId,
+      [
+        { candidate: op, embedding: makeUnitVec(1), tokenCount: asTokenCount(10) },
+        { candidate: zombieA, embedding: slopVec, tokenCount: asTokenCount(14) },
+      ],
+      weights,
+    );
+    assert.equal(b1.verdicts[0]?.action, "suspect", "first zombie starts as suspect");
+
+    const b2 = engine.ingestEmbeddedBatch(
+      threadId,
+      [{ candidate: zombieB, embedding: slopVec, tokenCount: asTokenCount(14) }],
+      weights,
+    );
+    assert.equal(b2.verdicts[0]?.action, "dim");
+    assert.equal(b2.verdicts[0]?.reason.kind, "thread_clone");
+    assert.equal(b2.retroactiveUpdates.length, 1, "suspect peer is retroactively promoted to dim");
+    assert.equal(b2.retroactiveUpdates[0]?.tweetId, "8401");
+    assert.equal(b2.retroactiveUpdates[0]?.action, "dim");
+    assert.equal(b2.retroactiveUpdates[0]?.reason.kind, "thread_clone");
+
+    // Re-evaluating the thread (e.g. after settings or weightsRevision bump) MUST NOT flip zombieA back!
+    const reeval = engine.reevaluateThread(threadId, weights, {
+      ...DEFAULT_FILTER_SETTINGS,
+      revision: 2,
+    });
+    const reevalA = reeval.find((v) => v.tweetId === "8401");
+    assert.equal(reevalA?.action, "dim", "promoted canonical clone persists across re-evaluation");
+    assert.equal(reevalA?.reason.kind, "thread_clone");
+  });
+
+  it("Minor #1, #4, #5 & #32-19: shields unanchored focalAuthorId, preserves replay on rollback, persists live precision, and merges imports", () => {
+    const engine = new ThreadFilterEngine();
+    let weights = createInitialClassifierWeights();
+    const threadId = "8500" as ThreadId;
+    const focalAuthor = "thread_author" as AuthorId;
+
+    // No OP candidate in batch (OP scrolled off / virtualized away), only focalAuthorId from URL!
+    const opFollowup = makeCandidate("8501", "thread_author", "@grok explain this chart", {
+      verified: true,
+      graphqlMeta: makeGqlMeta({ isBlueVerified: true, verifiedType: "blue", following: false }),
+    });
+    const filterRes = engine.filterUnseenCandidates(
+      threadId,
+      [opFollowup],
+      weights,
+      DEFAULT_FILTER_SETTINGS,
+      focalAuthor,
+    );
+    assert.equal(filterRes.toEmbed.length, 1);
+
+    const ingested = engine.ingestEmbeddedBatch(
+      threadId,
+      [{ candidate: opFollowup, embedding: getCalibratedSlopVec(), tokenCount: asTokenCount(4) }],
+      weights,
+    );
+    assert.equal(ingested.anchorKind, "unanchored");
+    assert.equal(ingested.verdicts[0]?.action, "keep", "focalAuthorId shields unanchored OP follow-up");
+    assert(ingested.verdicts[0]?.explanation?.shields.includes("op_author"));
+
+    // Minor #4: rollback preserves the new replay entry while reverting theta
+    const entryA: FeedbackReplayEntry = {
+      tweetId: "8510" as TweetId,
+      z: new Array(COMPACT_V2_DIM).fill(0),
+      fixed: 0,
+      y: 1,
+      lang: "en",
+      tsMs: 1_700_000_000_000,
+      topicHash: 11,
+      source: "user_spam",
+    };
+    const impossibleGate = { ...ANCHOR_SET_V2, targetPrecisionDim: 1.05 };
+    const rolled = trainFromReplayBuffer(weights, [entryA], { anchorSet: impossibleGate });
+    assert.equal(rolled.rolledBack, true);
+    assert.equal(rolled.nextWeights.replayBuffer?.length, 1, "rollback preserves replay entry");
+
+    // Minor #5: live precision counters persist on weights & restore on undo
+    const spamReply = makeCandidate(
+      "8520",
+      "bot_precision_test",
+      "Check my pinned tweet for 100x crypto signals!",
+      { graphqlMeta: makeGqlMeta() },
+    );
+    const bSpam = engine.ingestEmbeddedBatch(
+      threadId,
+      [{ candidate: spamReply, embedding: getCalibratedSlopVec(), tokenCount: asTokenCount(8) }],
+      weights,
+    );
+    assert.equal(bSpam.verdicts[0]?.action, "dim");
+
+    const fbHuman = engine.applyUserFeedback(threadId, "8520" as TweetId, "human", weights);
+    assert(fbHuman !== null);
+    weights = fbHuman.nextWeights;
+    assert.equal(weights.dimsReviewedCount, 1);
+    assert.equal(weights.dimsOverriddenHumanCount, 1);
+    // Fresh engine instance reads persisted counters from weights!
+    const freshEngine = new ThreadFilterEngine();
+    assert.equal(freshEngine.getDiagnosticsSummary(weights).livePrecisionEstimate, 0);
+
+    // #32 Minor #19: importFeedbackJson merges imported replayBuffer into existing replayBuffer
+    const exportedJson = engine.exportFeedbackJson(weights);
+    const otherWeights: typeof weights = {
+      ...createInitialClassifierWeights(),
+      replayBuffer: [entryA],
+    };
+    const merged = engine.importFeedbackJson(exportedJson, otherWeights);
+    assert(merged !== null);
+    assert.equal(
+      merged.nextWeights.replayBuffer?.length,
+      2,
+      "import merges existing and imported replay entries instead of wiping existing ones",
+    );
+
+    const undone = engine.undoLastFeedback(weights);
+    assert(undone !== null);
+    assert.equal(undone.nextWeights.dimsReviewedCount, 0);
+    assert.equal(undone.nextWeights.dimsOverriddenHumanCount, 0);
+  });
+
+  it("MAJOR #6: rpc.ts degrades malformed graphqlMeta, skips invalid candidates, rejects NaN ratios, caps sizes, and parses focalAuthorId", () => {
+    const validCand = makeCandidate("8601", "good_user", "A".repeat(4500));
+    const malformedMetaCand = {
+      ...makeCandidate("8602", "drift_user", "Normal reply with drifted schema"),
+      graphqlMeta: { favoriteCount: "not_a_number", verifiedType: "bogus" },
+    };
+    const invalidCand = {
+      ...makeCandidate("8603", "bad_ratio_user", "NaN ratio"),
+      domSignals: { ...validCand.domSignals, emojiToCharRatio: Number.NaN },
+    };
+
+    const req = parseRpcRequestV2({
+      kind: "evaluate_batch",
+      threadId: "8600",
+      focalAuthorId: "@Thread_OP",
+      candidates: [validCand, malformedMetaCand, invalidCand],
+    });
+    assert(req !== null && req.kind === "evaluate_batch");
+    assert.equal(req.focalAuthorId, "thread_op");
+    assert.equal(req.candidates.length, 2, "invalid candidate skipped instead of dropping whole batch");
+    assert.equal(req.candidates[0]?.rawText.length, 4000, "rawText capped to 4000 chars");
+    assert.equal(req.candidates[1]?.tweetId, "8602");
+    assert.equal(req.candidates[1]?.graphqlMeta, null, "malformed graphqlMeta degraded to null");
+
+    // Batch cap at 200 candidates
+    const oversized = Array.from({ length: 225 }, (_, i) =>
+      makeCandidate(`${9000 + i}`, `u_${i}`, "hello world"),
+    );
+    const cappedReq = parseRpcRequestV2({
+      kind: "evaluate_batch",
+      threadId: "8600",
+      candidates: oversized,
+    });
+    assert(cappedReq !== null && cappedReq.kind === "evaluate_batch");
+    assert.equal(cappedReq.candidates.length, 200, "candidates capped at 200");
+
+    // parseStage2VerdictUpdate validates explanation shape and caps snippet
+    assert.equal(
+      parseStage2VerdictUpdate({
+        kind: "stage2_verdict_update",
+        threadId: "8600",
+        tweetId: "8601",
+        verdict: {
+          tweetId: "8601",
+          action: "keep",
+          score: 0.1,
+          tokenCount: 5,
+          reason: { kind: "clean", action: "keep" },
+          explanation: { schemaVersion: 999 },
+        },
+      }),
+      null,
+      "malformed explanation rejected",
+    );
+    const cappedS2 = parseStage2VerdictUpdate({
+      kind: "stage2_verdict_update",
+      threadId: "8600",
+      tweetId: "8601",
+      verdict: {
+        tweetId: "8601",
+        action: "keep",
+        score: 0.1,
+        tokenCount: 5,
+        snippet: "S".repeat(300),
+        reason: { kind: "clean", action: "keep" },
+      },
+    });
+    assert(cappedS2 !== null);
+    assert.equal(cappedS2.verdict.snippet?.length, 160, "Stage-2 snippet capped at 160 chars");
   });
 });

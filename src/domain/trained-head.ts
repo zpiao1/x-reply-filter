@@ -152,10 +152,13 @@ export function scoreCompactV2(
   const positives: SignalContribution[] = [];
   const negatives: SignalContribution[] = [];
 
+  const missingMask = feat.missingMask;
+
   for (let j = 0; j < COMPACT_V2_DIM; j++) {
     const id = FEATURE_IDS[j]!;
     const family = FEATURE_FAMILIES[j]!;
     const val = feat.vector[j] ?? 0;
+    const isMissing = (missingMask[j] ?? 0) === 1;
     let contrib = 0;
 
     if (j === 4) {
@@ -164,23 +167,34 @@ export function scoreCompactV2(
       contrib = params.fixedCoefs.generic * (val - xHuman5);
     } else {
       const wj = params.theta[j] ?? 0;
-      const zj = z[j] ?? 0;
       const zhj = zHuman[j] ?? 0;
+      let zj = isMissing ? zhj : (z[j] ?? 0);
+
+      // #33 MAJOR: m_reply_likes_rel (idx 50) is shield-only (contrib <= 0).
+      // Fresh replies with 0 likes never add positive bot logit or free "meta" corroboration.
+      if (j === 50 && !isMissing && wj <= 0) {
+        zj = Math.max(zj, zhj);
+      }
+
+      z[j] = zj;
       logit += wj * zj;
       baseHumanLogit += wj * zhj;
       contrib = wj * (zj - zhj);
     }
 
-    familyLogits[family] += contrib;
+    // Imputed/missing metadata features contribute 0 and never count toward familyLogits.
+    if (!isMissing) {
+      familyLogits[family] += contrib;
+    }
 
-    if (contrib >= 0.15) {
+    if (!isMissing && contrib >= 0.15) {
       const ev = feat.evidence[id];
       positives.push(
         ev !== undefined
           ? { id, family, value: val, contribution: contrib, evidence: ev }
           : { id, family, value: val, contribution: contrib },
       );
-    } else if (contrib <= -0.15) {
+    } else if (!isMissing && contrib <= -0.15) {
       const ev = feat.evidence[id];
       negatives.push(
         ev !== undefined
@@ -528,6 +542,7 @@ export function trainFromReplayBuffer(
         theta0,
         langBias: params.langBias,
         fixedCoefs: params.fixedCoefs,
+        replayBuffer,
         rollbackCount: (current.rollbackCount ?? 0) + 1,
         updateCount: current.updateCount + 1,
       },
