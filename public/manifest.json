@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "X Bot & AI Slop Reply Filter",
-  "version": "0.1.0",
-  "description": "Locally dims AI bot paraphrases, thread clones, and spam replies on X across English, Chinese, and Japanese using EmbeddingGemma-300M on WebGPU.",
+  "version": "0.2.0",
+  "description": "Locally filters AI slop, reply-guys, thread clones, and spam on X across EN/ZH/JA via EmbeddingGemma-300M on WebGPU.",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -32,6 +32,12 @@
     }
   },
   "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["graphql-tap.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
       "js": ["content.js"],

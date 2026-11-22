@@ -7,11 +7,14 @@
       :root {
         color-scheme: dark;
       }
+      * {
+        box-sizing: border-box;
+      }
       body {
         margin: 0;
         padding: 12px;
-        width: 420px;
-        max-height: 560px;
+        width: 440px;
+        max-height: 580px;
         overflow-y: auto;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         font-size: 12px;
@@ -26,16 +29,26 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
+        gap: 8px;
       }
       .brand {
         display: inline-flex;
         align-items: center;
         gap: 6px;
+        min-width: 0;
       }
       .brand img {
         width: 20px;
         height: 20px;
         border-radius: 4px;
+        flex-shrink: 0;
+      }
+      .pills {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
       }
       h2 {
         margin: 12px 0 6px;
@@ -46,32 +59,195 @@
         color: #8b98a5;
       }
       .status-pill {
-        padding: 2px 8px;
+        padding: 2px 7px;
         border-radius: 999px;
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 600;
+        white-space: nowrap;
+      }
+      .pill-ok {
         background: rgba(0, 186, 124, 0.16);
         color: #00ba7c;
       }
-      .grid {
+      .pill-warn {
+        background: rgba(245, 158, 11, 0.16);
+        color: #f59e0b;
+      }
+      .pill-bad {
+        background: rgba(244, 33, 46, 0.16);
+        color: #f47178;
+      }
+      .pill-muted {
+        background: rgba(139, 152, 165, 0.16);
+        color: #8b98a5;
+      }
+      .grid-5 {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 6px;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 5px;
       }
       .card {
         background: #16181c;
         border: 1px solid #2f3336;
         border-radius: 8px;
-        padding: 6px 8px;
+        padding: 6px 7px;
+        min-width: 0;
       }
       .card-label {
         font-size: 10px;
         color: #8b98a5;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .card-value {
-        font-size: 15px;
+        font-size: 14px;
         font-weight: 700;
         margin-top: 2px;
+      }
+      .val-dim {
+        color: #f47178;
+      }
+      .val-suspect {
+        color: #f59e0b;
+      }
+      .val-keep {
+        color: #00ba7c;
+      }
+      .telemetry-sub {
+        margin-top: 5px;
+        font-size: 10px;
+        color: #8b98a5;
+      }
+      .segmented {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 4px;
+        background: #16181c;
+        border: 1px solid #2f3336;
+        border-radius: 8px;
+        padding: 3px;
+      }
+      .seg-btn {
+        border: none;
+        background: transparent;
+        color: #8b98a5;
+        border-radius: 6px;
+        padding: 5px 6px;
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 120ms ease, color 120ms ease;
+      }
+      .seg-btn:hover {
+        color: #e7e9ea;
+      }
+      .seg-btn.active {
+        background: #1d9bf0;
+        color: #ffffff;
+      }
+      .panel {
+        background: #16181c;
+        border: 1px solid #2f3336;
+        border-radius: 8px;
+        padding: 7px 9px;
+      }
+      .toggle-list {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 11px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .toggle-row input[type="checkbox"] {
+        accent-color: #1d9bf0;
+        cursor: pointer;
+        margin: 0;
+      }
+      .stage2-prepare-box {
+        margin-top: 7px;
+        padding-top: 7px;
+        border-top: 1px solid #2f3336;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .stage2-hint {
+        font-size: 10px;
+        color: #8b98a5;
+        flex: 1 1 180px;
+      }
+      .learner-stats {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+        margin-bottom: 7px;
+      }
+      .learner-stat {
+        background: #0f1419;
+        border: 1px solid #2f3336;
+        border-radius: 6px;
+        padding: 4px 6px;
+      }
+      .learner-stat-label {
+        font-size: 10px;
+        color: #8b98a5;
+      }
+      .learner-stat-val {
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .btn-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+      }
+      .btn {
+        border: 1px solid #2f3336;
+        background: #202327;
+        color: #e7e9ea;
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .btn:hover {
+        background: #2b2f35;
+      }
+      .btn-secondary {
+        border-color: rgba(29, 155, 240, 0.45);
+        background: rgba(29, 155, 240, 0.14);
+        color: #71c9f8;
+      }
+      .btn-secondary:hover {
+        background: rgba(29, 155, 240, 0.24);
+      }
+      .btn-danger {
+        border-color: rgba(244, 33, 46, 0.35);
+        color: #f47178;
+      }
+      .btn-confirm {
+        border-color: #f4212e;
+        background: rgba(244, 33, 46, 0.22);
+        color: #ff8a90;
+      }
+      .hidden-input {
+        display: none;
+      }
+      .action-note {
+        margin-top: 6px;
+        font-size: 10px;
+        color: #71c9f8;
       }
       .chips {
         display: flex;
@@ -83,7 +259,16 @@
         border: 1px solid #2f3336;
         border-radius: 6px;
         padding: 2px 6px;
-        font-size: 11px;
+        font-size: 10px;
+      }
+      .chip-signal {
+        border-color: rgba(29, 155, 240, 0.28);
+      }
+      .subhead {
+        margin: 8px 0 4px;
+        font-size: 10px;
+        font-weight: 600;
+        color: #8b98a5;
       }
       table {
         width: 100%;
@@ -96,7 +281,7 @@
       th,
       td {
         text-align: left;
-        padding: 5px 7px;
+        padding: 4px 7px;
         border-bottom: 1px solid #2f3336;
         font-size: 11px;
       }
@@ -110,22 +295,71 @@
       .verdict-row {
         background: #16181c;
         border: 1px solid #2f3336;
+        border-left: 3px solid #2f3336;
         border-radius: 8px;
         padding: 6px 8px;
         margin-bottom: 6px;
+      }
+      .verdict-dim {
+        border-left-color: #f47178;
+      }
+      .verdict-suspect {
+        border-left-color: #f59e0b;
+      }
+      .verdict-keep {
+        border-left-color: #00ba7c;
       }
       .verdict-head {
         display: flex;
         justify-content: space-between;
         align-items: center;
+        gap: 6px;
         font-weight: 600;
         margin-bottom: 3px;
+      }
+      .verdict-tags {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
       }
       .tag-dim {
         color: #f47178;
       }
+      .tag-suspect {
+        color: #f59e0b;
+      }
       .tag-keep {
         color: #00ba7c;
+      }
+      .meta-pill,
+      .stage2-pill {
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+      .meta-graphql {
+        background: rgba(29, 155, 240, 0.16);
+        color: #71c9f8;
+      }
+      .meta-dom {
+        background: rgba(139, 152, 165, 0.16);
+        color: #8b98a5;
+      }
+      .stage2-bot {
+        background: rgba(244, 33, 46, 0.16);
+        color: #f47178;
+      }
+      .stage2-human {
+        background: rgba(0, 186, 124, 0.16);
+        color: #00ba7c;
+      }
+      .stage2-uncertain {
+        background: rgba(245, 158, 11, 0.16);
+        color: #f59e0b;
       }
       .verdict-snippet {
         color: #d6d9db;
@@ -133,6 +367,22 @@
         overflow: hidden;
         text-overflow: ellipsis;
         margin-bottom: 3px;
+      }
+      .verdict-signals {
+        font-size: 10px;
+        margin-bottom: 2px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .sig-up {
+        color: #f47178;
+      }
+      .sig-down {
+        color: #00ba7c;
+      }
+      .sig-cap {
+        color: #f59e0b;
       }
       .verdict-metrics {
         color: #8b98a5;

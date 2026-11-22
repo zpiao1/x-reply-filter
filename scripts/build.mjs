@@ -21,6 +21,14 @@ await mkdir(distIconsDir, { recursive: true });
 
 await Promise.all([
   build({
+    entryPoints: [path.join(rootDir, "src/content/graphql-tap.ts")],
+    outfile: path.join(distDir, "graphql-tap.js"),
+    bundle: true,
+    format: "iife",
+    target: "es2022",
+    platform: "browser",
+  }),
+  build({
     entryPoints: [path.join(rootDir, "src/content/index.ts")],
     outfile: path.join(distDir, "content.js"),
     bundle: true,

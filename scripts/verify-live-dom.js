@@ -41,13 +41,41 @@ async () => {
   for (const bar of bars) {
     const rect = bar.getBoundingClientRect();
     const isDirectChildOfArticle = bar.parentElement?.tagName === "ARTICLE";
+    const state =
+      bar.closest("article")?.getAttribute("data-xrf-state") ?? "unknown";
     if (isDirectChildOfArticle || rect.height > 36) {
       layoutViolations.push({
+        state,
         text: bar.textContent,
         width: Math.round(rect.width),
         height: Math.round(rect.height),
         isDirectChildOfArticle,
       });
+    }
+  }
+
+  let dimmedCount = 0;
+  let suspectCount = 0;
+  let keptCount = 0;
+  let revealedCount = 0;
+  let graphqlEnrichedCount = 0;
+  for (const article of Array.from(document.querySelectorAll("article[data-xrf-state]"))) {
+    const state = article.getAttribute("data-xrf-state");
+    if (state === "dimmed") {
+      dimmedCount += 1;
+    } else if (state === "suspect") {
+      suspectCount += 1;
+    } else if (state === "clean") {
+      keptCount += 1;
+    } else if (state === "revealed") {
+      revealedCount += 1;
+    }
+    const bar = article.querySelector(".xrf-control-bar");
+    const isGraphql =
+      article.getAttribute("data-xrf-meta-source") === "graphql" ||
+      /\b(?:metaSource|meta)\s*=\s*(?:graphql|GQL)\b/i.test(bar?.getAttribute("title") ?? "");
+    if (isGraphql) {
+      graphqlEnrichedCount += 1;
     }
   }
 
@@ -81,6 +109,11 @@ async () => {
       scoredBelowCutoff === 0,
     url: window.location.href,
     barCount: bars.length,
+    dimmedCount,
+    suspectCount,
+    keptCount,
+    revealedCount,
+    graphqlEnrichedCount,
     xrfMutationsInWindow,
     layoutViolations,
     seenCutoff,
