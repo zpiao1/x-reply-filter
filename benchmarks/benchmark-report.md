@@ -153,7 +153,7 @@ For users on Chrome 138+ desktop who opt in via popup settings, Chrome's built-i
 
 ---
 
-## 7. Shipped Benchmark Artifacts (`C:\Users\zpiao\x-reply-filter\benchmarks\`)
+## 7. Shipped Benchmark Artifacts (`benchmarks/`)
 
 - `benchmarks/dataset.json` — 200-case multilingual EN/ZH-Hans/ZH-Hant/JA evaluation dataset matching `#5` & `#6`.
 - `benchmarks/features-v2.ts` — Exact 58-dim `COMPACT_V2` extractor + both validated micro-fixes + Rule Table v2 R0–R12 + C1–C5.
