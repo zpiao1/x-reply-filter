@@ -62,6 +62,10 @@ const POLICY_TOGGLE_ITEMS: ReadonlyArray<{
   { key: "enableStage2", label: "Enable Stage-2 Gemini Nano judge" },
 ];
 
+const VALID_TOGGLE_KEYS: ReadonlySet<string> = new Set(
+  POLICY_TOGGLE_ITEMS.map((item) => item.key),
+);
+
 const LANG_DISPLAY_KEYS = ["en", "zh-Hans", "zh-Hant", "ja", "other"] as const;
 
 function escapeHtml(text: string): string {
@@ -444,7 +448,18 @@ function getChromeLanguageModelApi(): ChromeLanguageModelApi | undefined {
 }
 
 async function sendPopupRpc(req: OffscreenRpcRequestV2): Promise<OffscreenRpcResponse> {
-  return (await chrome.runtime.sendMessage(req)) as OffscreenRpcResponse;
+  try {
+    const raw = (await chrome.runtime.sendMessage(req)) as OffscreenRpcResponse | undefined;
+    if (!raw || typeof raw !== "object" || typeof raw.kind !== "string") {
+      return { kind: "rpc_error", message: "No response from background worker." };
+    }
+    return raw;
+  } catch (err) {
+    return {
+      kind: "rpc_error",
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 async function probeLocalStage2Availability(): Promise<Stage2StatusTag | undefined> {
@@ -476,6 +491,8 @@ interface PopupRuntimeState {
   gpuStatus: string;
   deviceEpoch: number;
   summary: DiagnosticsSummary | null;
+  pendingSettings: FilterSettings | null;
+  pendingSettingsInFlight: number;
   stage2Status: Stage2StatusTag | undefined;
   stage2Progress: number | undefined;
   stage2Hint: string | undefined;
@@ -483,7 +500,7 @@ interface PopupRuntimeState {
   actionFeedback: string | undefined;
 }
 
-async function bootPopup(): Promise<void> {
+export async function bootPopup(): Promise<void> {
   const app = document.getElementById("app");
   if (!app) {
     return;
@@ -493,12 +510,15 @@ async function bootPopup(): Promise<void> {
     gpuStatus: "unloaded",
     deviceEpoch: 0,
     summary: null,
+    pendingSettings: null,
+    pendingSettingsInFlight: 0,
     stage2Status: undefined,
     stage2Progress: undefined,
     stage2Hint: undefined,
     resetConfirmArmed: false,
     actionFeedback: undefined,
   };
+  let settingsQueue: Promise<void> = Promise.resolve();
 
   const render = (): void => {
     if (!state.summary) return;
@@ -516,7 +536,12 @@ async function bootPopup(): Promise<void> {
     if (res.kind === "diagnostics_ok") {
       state.gpuStatus = res.gpuStatus;
       state.deviceEpoch = res.deviceEpoch;
-      state.summary = res.summary;
+      if (state.pendingSettingsInFlight > 0 && state.pendingSettings !== null) {
+        state.summary = { ...res.summary, settings: state.pendingSettings };
+      } else {
+        state.pendingSettings = null;
+        state.summary = res.summary;
+      }
       if (res.stage2Status !== undefined) {
         state.stage2Status = res.stage2Status;
       }
@@ -538,12 +563,61 @@ async function bootPopup(): Promise<void> {
       }
       render();
     } else if (res.kind === "rpc_error") {
-      app.textContent = `Diagnostics error: ${res.message}`;
+      if (state.summary === null) {
+        app.textContent = `Diagnostics error: ${res.message}`;
+      } else {
+        state.actionFeedback = `Diagnostics error: ${res.message}`;
+        render();
+      }
     }
   };
 
   const getCurrentSettings = (): FilterSettings =>
-    state.summary?.settings ?? DEFAULT_FILTER_SETTINGS;
+    state.pendingSettings ?? state.summary?.settings ?? DEFAULT_FILTER_SETTINGS;
+
+  const enqueueSettingsUpdate = (
+    buildNext: (cur: FilterSettings) => FilterSettings,
+    successNote: string,
+    onSuccess?: () => Promise<void>,
+  ): void => {
+    const cur = getCurrentSettings();
+    const nextSettings = buildNext(cur);
+    state.resetConfirmArmed = false;
+    state.pendingSettings = nextSettings;
+    state.pendingSettingsInFlight += 1;
+    if (state.summary) {
+      state.summary = { ...state.summary, settings: nextSettings };
+    }
+    render();
+
+    settingsQueue = settingsQueue.then(async () => {
+      try {
+        const res = await sendPopupRpc({
+          kind: "update_settings",
+          settings: nextSettings,
+          target: "background",
+        });
+        if (res.kind === "rpc_error") {
+          state.actionFeedback = `Settings update failed: ${res.message}`;
+          if (state.pendingSettingsInFlight <= 1) {
+            state.pendingSettings = null;
+          }
+        } else {
+          state.actionFeedback = successNote;
+          if (onSuccess) {
+            await onSuccess();
+          }
+        }
+      } finally {
+        state.pendingSettingsInFlight = Math.max(0, state.pendingSettingsInFlight - 1);
+        if (state.pendingSettingsInFlight === 0) {
+          await refreshDiagnostics();
+        } else {
+          render();
+        }
+      }
+    });
+  };
 
   app.addEventListener("click", (ev) => {
     const target = ev.target;
@@ -553,26 +627,14 @@ async function bootPopup(): Promise<void> {
     if (presetBtn) {
       const preset = presetBtn.getAttribute("data-preset");
       if (preset === "conservative" || preset === "balanced" || preset === "strict") {
-        const cur = getCurrentSettings();
-        state.resetConfirmArmed = false;
-        void (async () => {
-          const res = await sendPopupRpc({
-            kind: "update_settings",
-            settings: {
-              preset,
-              toggles: cur.toggles,
-              revision: cur.revision + 1,
-            },
-            target: "background",
-          });
-          if (res.kind === "rpc_error") {
-            state.actionFeedback = `Preset update failed: ${res.message}`;
-            render();
-          } else {
-            state.actionFeedback = `Switched preset to ${preset}.`;
-            await refreshDiagnostics();
-          }
-        })();
+        enqueueSettingsUpdate(
+          (cur) => ({
+            preset,
+            toggles: cur.toggles,
+            revision: cur.revision + 1,
+          }),
+          `Switched preset to ${preset}.`,
+        );
       }
       return;
     }
@@ -724,46 +786,38 @@ async function bootPopup(): Promise<void> {
     const target = ev.target;
     if (!(target instanceof HTMLInputElement)) return;
 
-    const toggleKey = target.getAttribute("data-toggle") as keyof PolicyToggles | null;
-    if (toggleKey !== null) {
-      const cur = getCurrentSettings();
-      const nextToggles: PolicyToggles = {
-        ...cur.toggles,
-        [toggleKey]: target.checked,
-      };
-      state.resetConfirmArmed = false;
-      void (async () => {
-        const res = await sendPopupRpc({
-          kind: "update_settings",
-          settings: {
-            preset: cur.preset,
-            toggles: nextToggles,
-            revision: cur.revision + 1,
+    const rawToggleKey = target.getAttribute("data-toggle");
+    if (rawToggleKey !== null && VALID_TOGGLE_KEYS.has(rawToggleKey)) {
+      const toggleKey = rawToggleKey as keyof PolicyToggles;
+      const checked = target.checked;
+      enqueueSettingsUpdate(
+        (cur) => ({
+          preset: cur.preset,
+          toggles: {
+            ...cur.toggles,
+            [toggleKey]: checked,
           },
-          target: "background",
-        });
-        if (res.kind === "rpc_error") {
-          state.actionFeedback = `Toggle update failed: ${res.message}`;
-          render();
-          return;
-        }
-        if (toggleKey === "enableStage2") {
-          if (target.checked) {
-            const statusRes = await sendPopupRpc({
-              kind: "trigger_stage2_download",
-              action: "status",
-              target: "background",
-            });
-            if (statusRes.kind === "stage2_status_ok") {
-              state.stage2Status = statusRes.status;
+          revision: cur.revision + 1,
+        }),
+        `Updated ${toggleKey}.`,
+        toggleKey === "enableStage2"
+          ? async () => {
+              if (checked) {
+                const statusRes = await sendPopupRpc({
+                  kind: "trigger_stage2_download",
+                  action: "status",
+                  target: "background",
+                });
+                if (statusRes.kind === "stage2_status_ok") {
+                  state.stage2Status = statusRes.status;
+                }
+              } else {
+                state.stage2Status = "disabled";
+                state.stage2Hint = undefined;
+              }
             }
-          } else {
-            state.stage2Status = "disabled";
-            state.stage2Hint = undefined;
-          }
-        }
-        await refreshDiagnostics();
-      })();
+          : undefined,
+      );
       return;
     }
 
