@@ -1,8 +1,9 @@
-import { extractDomSignalsFromText } from "../domain/seeds.ts";
+import { extractDomSignalsFromText } from "../domain/stylometrics.ts";
 import {
   type AuthorId,
   type CandidateTweet,
   type FilterReason,
+  type GraphqlTweetMeta,
   type ThreadId,
   type TweetId,
   type VerdictRecord,
@@ -46,6 +47,16 @@ article[data-xrf-state="revealed"] [data-testid="card.wrapper"] {
   opacity: 1 !important;
   filter: none !important;
 }
+article[data-xrf-state="suspect"] {
+  border-left: 2px solid rgba(245, 158, 11, 0.55) !important;
+}
+article[data-xrf-state="suspect"] [data-testid="tweetText"],
+article[data-xrf-state="suspect"] [data-testid="tweetPhoto"],
+article[data-xrf-state="suspect"] [data-testid="videoPlayer"],
+article[data-xrf-state="suspect"] [data-testid="card.wrapper"] {
+  opacity: 1 !important;
+  filter: none !important;
+}
 .xrf-control-bar {
   display: inline-flex !important;
   flex-direction: row !important;
@@ -55,6 +66,9 @@ article[data-xrf-state="revealed"] [data-testid="card.wrapper"] {
   width: fit-content !important;
   max-width: 100% !important;
   height: auto !important;
+  box-sizing: border-box !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
   gap: 6px;
   margin-top: 6px;
   padding: 2px 8px;
@@ -74,12 +88,23 @@ article[data-xrf-state="dimmed"] .xrf-control-bar {
   background: rgba(244, 33, 46, 0.14);
   color: rgb(244, 113, 120);
 }
+.xrf-control-bar[data-xrf-bar-action="suspect"] {
+  background: rgba(245, 158, 11, 0.14);
+  color: rgb(251, 191, 36);
+  border: 1px solid rgba(245, 158, 11, 0.28);
+}
 .xrf-control-bar[data-xrf-bar-action="keep"] {
   opacity: 0;
   transition: opacity 120ms ease;
 }
 article[data-testid="tweet"]:hover .xrf-control-bar[data-xrf-bar-action="keep"] {
   opacity: 0.85;
+}
+.xrf-badge {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 .xrf-btn {
   border: none;
@@ -91,6 +116,8 @@ article[data-testid="tweet"]:hover .xrf-control-bar[data-xrf-bar-action="keep"] 
   font-weight: 600;
   text-decoration: underline;
   opacity: 0.85;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .xrf-btn:hover {
   opacity: 1;
@@ -126,9 +153,26 @@ export function isDiscoverMoreDivider(cell: Element): boolean {
   return false;
 }
 
+function isInsideQuoteOnly(node: Element, article: Element): boolean {
+  let curr: Element | null = node.parentElement;
+  while (curr !== null && curr !== article) {
+    if (curr.tagName.toUpperCase() === "ARTICLE") {
+      return true;
+    }
+    if (curr.getAttribute("data-testid") === "quoteTweet") {
+      return true;
+    }
+    curr = curr.parentElement;
+  }
+  return false;
+}
+
 function isInsideQuoteTweet(node: Element, article: Element): boolean {
   let curr: Element | null = node.parentElement;
   while (curr !== null && curr !== article) {
+    if (curr.tagName.toUpperCase() === "ARTICLE") {
+      return true;
+    }
     const testId = curr.getAttribute("data-testid");
     if (testId === "quoteTweet" || testId === "card.wrapper") {
       return true;
@@ -136,6 +180,35 @@ function isInsideQuoteTweet(node: Element, article: Element): boolean {
     curr = curr.parentElement;
   }
   return false;
+}
+
+/**
+ * Recursively extracts tweet text including X's <img alt="..."> Twemoji icons
+ * and <br> newlines without relying on browser-only instanceof constructors.
+ */
+export function extractTweetTextWithTwemoji(node: Node | null): string {
+  if (node === null) {
+    return "";
+  }
+  if (node.nodeType === 3) {
+    return node.nodeValue ?? "";
+  }
+  if (node.nodeType !== 1) {
+    return "";
+  }
+  const el = node as Element;
+  const tag = el.tagName.toUpperCase();
+  if (tag === "IMG") {
+    return el.getAttribute("alt") ?? "";
+  }
+  if (tag === "BR") {
+    return "\n";
+  }
+  let out = "";
+  for (let child = el.firstChild; child !== null; child = child.nextSibling) {
+    out += extractTweetTextWithTwemoji(child);
+  }
+  return out;
 }
 
 function extractStatusIdentity(
@@ -175,34 +248,103 @@ function findControlMountContainer(article: Element): Element {
   if (textNode?.parentElement && textNode.parentElement !== article) {
     return textNode.parentElement;
   }
-  const actionGroup = article.querySelector('div[role="group"]');
-  if (actionGroup?.parentElement && actionGroup.parentElement !== article) {
-    return actionGroup.parentElement;
+  const actionGroups = Array.from(article.querySelectorAll('div[role="group"]'));
+  for (let i = actionGroups.length - 1; i >= 0; i--) {
+    const group = actionGroups[i]!;
+    if (!isInsideQuoteTweet(group, article) && group.parentElement && group.parentElement !== article) {
+      return group.parentElement;
+    }
+  }
+  if (article.firstElementChild && article.firstElementChild !== article) {
+    return article.firstElementChild;
   }
   return article;
+}
+
+function clearRecycledArticleAttributes(article: Element): void {
+  article.removeAttribute("data-xrf-state");
+  article.removeAttribute("data-xrf-reason");
+  article.removeAttribute("data-xrf-score");
+  article.removeAttribute("data-xrf-tokens");
+  article.removeAttribute("data-xrf-siamese");
+  article.removeAttribute("data-xrf-op-sim");
+  article.removeAttribute("data-xrf-clone-sim");
+  article.removeAttribute("data-xrf-author-prior");
+  article.removeAttribute("data-xrf-meta-source");
+  article.removeAttribute("data-xrf-user-revealed");
+  article.querySelector(".xrf-control-bar")?.remove();
 }
 
 export function formatFilterReasonBadge(reason: FilterReason): string {
   switch (reason.kind) {
     case "known_bot_author":
       return `Known bot (@${reason.authorId}, ${reason.spamCount}x)`;
+    case "keyword_spam":
+      return `Spam (${reason.matchedPattern})`;
+    case "bio_scam":
+      return `Bio scam (${reason.matchedPattern})`;
+    case "bot_summon":
+      return `Bot summon (${reason.handle})`;
+    case "bot_answer":
+      return `Bot reply (@${reason.authorId})`;
+    case "blue_short_praise":
+      return `Blue praise${reason.confirmedUnfollowed ? "" : " ?"}`;
+    case "media_only_blue":
+      return `Media-only blue${reason.confirmedUnfollowed ? "" : " ?"}`;
     case "op_paraphrase":
       return `AI paraphrase (${Math.round(reason.similarityToOp * 100)}%)`;
     case "thread_clone":
       return `Bot clone (${reason.clusterSize}x)`;
-    case "keyword_spam":
-      return `Spam (${reason.matchedPattern})`;
     case "siamese_bot":
       return `Likely AI bot (${Math.round(reason.probability * 100)}%)`;
+    case "model_suspect":
+      return `Borderline (${Math.round(reason.probability * 100)}%)`;
     case "user_override":
       return reason.label === "spam" ? "Marked bot" : "Marked human";
     case "short_human_exempt":
     case "clean":
       return "Clean";
   }
+  const _exhaustive: never = reason;
+  return _exhaustive;
 }
 
 export function formatDiagnosticsTooltip(verdict: VerdictRecord): string {
+  const exp = verdict.explanation;
+  if (exp) {
+    const parts: string[] = [
+      `tier=${exp.tier}`,
+      `rule=${exp.ruleId}`,
+      `p=${Math.round(exp.probability * 100)}% (${exp.preset})`,
+    ];
+    if (exp.top.length > 0) {
+      const topStr = exp.top
+        .map((s) => `${s.id}+${s.contribution.toFixed(2)}${s.evidence ? `(${s.evidence})` : ""}`)
+        .join(", ");
+      parts.push(`top=[${topStr}]`);
+    }
+    if (exp.counter.length > 0) {
+      const counterStr = exp.counter
+        .map((s) => `${s.id}${s.contribution.toFixed(2)}`)
+        .join(", ");
+      parts.push(`counter=[${counterStr}]`);
+    }
+    parts.push(`lang=${exp.lang.reply}${exp.lang.op ? `/${exp.lang.op}` : ""}`);
+    parts.push(`meta=${exp.metaSource}`);
+    if (exp.shields.length > 0) {
+      parts.push(`shields=${exp.shields.join(",")}`);
+    }
+    if (exp.caps.length > 0) {
+      parts.push(`caps=${exp.caps.join(",")}`);
+    }
+    if (exp.stage2) {
+      parts.push(
+        `stage2=${exp.stage2.verdict}(${Math.round(exp.stage2.confidence * 100)}%)`,
+      );
+    }
+    return parts.join(" | ");
+  }
+
   const d = verdict.diagnostics;
   if (!d) {
     return `reason=${verdict.reason.kind} | score=${verdict.score.toFixed(2)} | tokens=${verdict.tokenCount}`;
@@ -228,6 +370,7 @@ export class XThreadDomAdapter {
   public extractThreadSnapshot(
     root: ParentNode,
     locationPathname: string,
+    graphqlCache?: ReadonlyMap<TweetId, GraphqlTweetMeta>,
   ): ThreadDomSnapshot | null {
     const threadId = parseThreadId(locationPathname);
     if (threadId === null) {
@@ -251,8 +394,21 @@ export class XThreadDomAdapter {
       articles.push(...Array.from(root.querySelectorAll('article[data-testid="tweet"]')));
     }
 
-    const candidates: CandidateTweet[] = [];
+    interface ExtractedEntry {
+      readonly article: Element;
+      readonly identity: { readonly tweetId: TweetId; readonly authorId: AuthorId };
+      readonly rawText: string;
+      readonly hasVerifiedBadge: boolean;
+      readonly hasPrimaryMedia: boolean;
+      readonly hasExternalLink: boolean;
+      readonly hasQuote: boolean;
+      readonly graphqlMeta: GraphqlTweetMeta | null;
+      readonly isOp: boolean;
+    }
+
+    const entries: ExtractedEntry[] = [];
     let hasUnscoredReplies = false;
+    let focalIdx = -1;
 
     for (const article of articles) {
       const identity = extractStatusIdentity(article);
@@ -260,39 +416,88 @@ export class XThreadDomAdapter {
         continue;
       }
 
-      if (article.getAttribute("data-xrf-tweet-id") !== identity.tweetId) {
+      const prevTweetId = article.getAttribute("data-xrf-tweet-id");
+      if (prevTweetId !== identity.tweetId) {
+        if (prevTweetId !== null) {
+          clearRecycledArticleAttributes(article);
+        }
         article.setAttribute("data-xrf-tweet-id", identity.tweetId);
       }
 
       const isOp = identity.tweetId === (threadId as unknown as TweetId);
+      if (isOp && focalIdx === -1) {
+        focalIdx = entries.length;
+      }
       if (!isOp && article.getAttribute("data-xrf-state") === null) {
         hasUnscoredReplies = true;
       }
 
       const textNode = extractPrimaryTweetTextNode(article);
-      const rawText = (textNode?.textContent ?? "").trim();
-      const hasVerifiedBadge =
-        article.querySelector('[data-testid="icon-verified"]') !== null;
-      const hasMediaOrExternalLink =
-        article.querySelector(
-          '[data-testid="tweetPhoto"], [data-testid="videoPlayer"], [data-testid="card.wrapper"], a[target="_blank"]',
-        ) !== null;
+      const rawText = extractTweetTextWithTwemoji(textNode).trim();
+      const graphqlMeta = graphqlCache?.get(identity.tweetId) ?? null;
 
-      const domSignals = extractDomSignalsFromText(
+      const hasVerifiedBadge = Array.from(
+        article.querySelectorAll('[data-testid="icon-verified"]'),
+      ).some((el) => !isInsideQuoteTweet(el, article));
+
+      const domPrimaryMedia = Array.from(
+        article.querySelectorAll(
+          '[data-testid="tweetPhoto"], [data-testid="videoPlayer"], [data-testid="videoComponent"], video',
+        ),
+      ).some((el) => !isInsideQuoteTweet(el, article));
+      const hasPrimaryMedia =
+        domPrimaryMedia || (graphqlMeta !== null && graphqlMeta.mediaTypes.length > 0);
+
+      const hasExternalLink = Array.from(
+        article.querySelectorAll('[data-testid="card.wrapper"], a[target="_blank"]'),
+      ).some((el) => !isInsideQuoteOnly(el, article));
+
+      const hasQuote = Array.from(
+        article.querySelectorAll('[data-testid="quoteTweet"]'),
+      ).some((el) => !isInsideQuoteOnly(el, article));
+
+      entries.push({
+        article,
+        identity,
         rawText,
         hasVerifiedBadge,
-        hasMediaOrExternalLink,
-      );
-
-      candidates.push({
-        tweetId: identity.tweetId,
-        authorId: identity.authorId,
-        rawText,
-        normalizedText: rawText,
+        hasPrimaryMedia,
+        hasExternalLink,
+        hasQuote,
+        graphqlMeta,
         isOp,
-        domSignals,
       });
     }
+
+    const opMeta =
+      (focalIdx >= 0 ? entries[focalIdx]?.graphqlMeta : null) ??
+      graphqlCache?.get(threadId as unknown as TweetId) ??
+      null;
+    const opFavoriteCount = opMeta?.favoriteCount ?? null;
+
+    const candidates: CandidateTweet[] = entries.map((entry, idx) => {
+      const hasMediaOrExternalLink = entry.hasPrimaryMedia || entry.hasExternalLink;
+      const domSignals = extractDomSignalsFromText(
+        entry.rawText,
+        entry.hasVerifiedBadge,
+        hasMediaOrExternalLink,
+      );
+      const isContextAncestor = focalIdx >= 0 && idx < focalIdx;
+
+      return {
+        tweetId: entry.identity.tweetId,
+        authorId: entry.identity.authorId,
+        rawText: entry.rawText,
+        normalizedText: entry.rawText,
+        isOp: entry.isOp,
+        domSignals,
+        hasPrimaryMedia: entry.hasPrimaryMedia,
+        hasQuote: entry.hasQuote,
+        isContextAncestor,
+        ...(entry.graphqlMeta !== null ? { graphqlMeta: entry.graphqlMeta } : {}),
+        ...(opFavoriteCount !== null ? { opFavoriteCount } : {}),
+      };
+    });
 
     return { threadId, candidates, hasUnscoredReplies };
   }
@@ -320,15 +525,31 @@ export class XThreadDomAdapter {
           ? article.getAttribute("data-xrf-user-revealed") === "true"
             ? "revealed"
             : "dimmed"
-          : "clean";
+          : verdict.action === "suspect"
+            ? "suspect"
+            : "clean";
+
+      if (verdict.action !== "dim" && article.hasAttribute("data-xrf-user-revealed")) {
+        article.removeAttribute("data-xrf-user-revealed");
+      }
 
       const currentState = article.getAttribute("data-xrf-state");
       const currentReason = article.getAttribute("data-xrf-reason");
+      const existingBar = article.querySelector(".xrf-control-bar");
+      const stage2Tag = verdict.explanation?.stage2
+        ? `${verdict.explanation.stage2.verdict}:${verdict.explanation.stage2.confidence.toFixed(2)}`
+        : "";
+      const expTag = verdict.explanation
+        ? `${verdict.explanation.preset}:${verdict.explanation.metaSource}:${verdict.explanation.ruleId}:${verdict.explanation.top.map((s) => s.id).join(",")}`
+        : "";
 
       if (
         currentState === targetState &&
         currentReason === verdict.reason.kind &&
-        article.querySelector(".xrf-control-bar") !== null
+        existingBar !== null &&
+        existingBar.getAttribute("data-xrf-bar-action") === verdict.action &&
+        (existingBar.getAttribute("data-xrf-stage2") ?? "") === stage2Tag &&
+        (existingBar.getAttribute("data-xrf-exp") ?? "") === expTag
       ) {
         continue;
       }
@@ -337,6 +558,9 @@ export class XThreadDomAdapter {
       article.setAttribute("data-xrf-reason", verdict.reason.kind);
       article.setAttribute("data-xrf-score", verdict.score.toFixed(3));
       article.setAttribute("data-xrf-tokens", String(verdict.tokenCount));
+      if (verdict.explanation) {
+        article.setAttribute("data-xrf-meta-source", verdict.explanation.metaSource);
+      }
       if (verdict.diagnostics) {
         article.setAttribute(
           "data-xrf-siamese",
@@ -354,7 +578,7 @@ export class XThreadDomAdapter {
       }
 
       const mountTarget = findControlMountContainer(article);
-      let bar = article.querySelector(".xrf-control-bar");
+      let bar = existingBar;
       if (bar === null) {
         bar = ownerDoc.createElement("div");
         bar.className = "xrf-control-bar";
@@ -364,6 +588,16 @@ export class XThreadDomAdapter {
       }
 
       bar.setAttribute("data-xrf-bar-action", verdict.action);
+      if (stage2Tag !== "") {
+        bar.setAttribute("data-xrf-stage2", stage2Tag);
+      } else {
+        bar.removeAttribute("data-xrf-stage2");
+      }
+      if (expTag !== "") {
+        bar.setAttribute("data-xrf-exp", expTag);
+      } else {
+        bar.removeAttribute("data-xrf-exp");
+      }
       bar.setAttribute("title", formatDiagnosticsTooltip(verdict));
       bar.textContent = "";
 
@@ -373,7 +607,9 @@ export class XThreadDomAdapter {
         const resolvedAuthor = verdict.authorId ?? extractStatusIdentity(article)?.authorId;
         const baseBadge = formatFilterReasonBadge(verdict.reason);
         badge.textContent =
-          resolvedAuthor && verdict.reason.kind !== "known_bot_author"
+          resolvedAuthor &&
+          verdict.reason.kind !== "known_bot_author" &&
+          verdict.reason.kind !== "bot_answer"
             ? `@${resolvedAuthor} · ${baseBadge}`
             : baseBadge;
         bar.appendChild(badge);
@@ -384,6 +620,7 @@ export class XThreadDomAdapter {
         toggleBtn.textContent = targetState === "dimmed" ? "Show" : "Hide";
         toggleBtn.addEventListener("click", (ev) => {
           ev.stopPropagation();
+          ev.preventDefault?.();
           const nowRevealed = article.getAttribute("data-xrf-state") === "dimmed";
           article.setAttribute("data-xrf-user-revealed", nowRevealed ? "true" : "false");
           article.setAttribute("data-xrf-state", nowRevealed ? "revealed" : "dimmed");
@@ -397,18 +634,20 @@ export class XThreadDomAdapter {
         humanBtn.textContent = "Not spam";
         humanBtn.addEventListener("click", (ev) => {
           ev.stopPropagation();
+          ev.preventDefault?.();
           article.removeAttribute("data-xrf-user-revealed");
           onFeedback(verdict.tweetId, "human");
         });
         bar.appendChild(humanBtn);
-      } else {
-        const scoreHint = ownerDoc.createElement("span");
-        scoreHint.className = "xrf-score-hint";
-        const botPct = Math.round(
-          (verdict.diagnostics?.siameseProbability ?? verdict.score) * 100,
-        );
-        scoreHint.textContent = `Bot ${botPct}%`;
-        bar.appendChild(scoreHint);
+      } else if (verdict.action === "suspect") {
+        const badge = ownerDoc.createElement("span");
+        badge.className = "xrf-badge";
+        const baseBadge = formatFilterReasonBadge(verdict.reason);
+        badge.textContent =
+          verdict.reason.kind === "model_suspect"
+            ? baseBadge
+            : `Suspect · ${baseBadge}`;
+        bar.appendChild(badge);
 
         const spamBtn = ownerDoc.createElement("button");
         spamBtn.type = "button";
@@ -416,6 +655,31 @@ export class XThreadDomAdapter {
         spamBtn.textContent = "Mark bot";
         spamBtn.addEventListener("click", (ev) => {
           ev.stopPropagation();
+          ev.preventDefault?.();
+          article.removeAttribute("data-xrf-user-revealed");
+          onFeedback(verdict.tweetId, "spam");
+        });
+        bar.appendChild(spamBtn);
+
+        const humanBtn = ownerDoc.createElement("button");
+        humanBtn.type = "button";
+        humanBtn.className = "xrf-btn xrf-feedback-human";
+        humanBtn.textContent = "Not spam";
+        humanBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault?.();
+          article.removeAttribute("data-xrf-user-revealed");
+          onFeedback(verdict.tweetId, "human");
+        });
+        bar.appendChild(humanBtn);
+      } else {
+        const spamBtn = ownerDoc.createElement("button");
+        spamBtn.type = "button";
+        spamBtn.className = "xrf-btn xrf-feedback-spam";
+        spamBtn.textContent = "Mark bot";
+        spamBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault?.();
           article.removeAttribute("data-xrf-user-revealed");
           onFeedback(verdict.tweetId, "spam");
         });
