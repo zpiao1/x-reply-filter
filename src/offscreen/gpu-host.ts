@@ -6,7 +6,7 @@ import {
   createInitialClassifierWeights,
   recordAuthorOutcome,
 } from "../domain/seeds.ts";
-import { trainFromReplayBuffer } from "../domain/trained-head.ts";
+import { insertIntoReplayBuffer, trainFromReplayBuffer } from "../domain/trained-head.ts";
 import {
   type AuthorId,
   type AuthorStats,
@@ -390,6 +390,7 @@ export const SETTINGS_STORE_NAME = "settings_v2" as const;
 export const WEIGHTS_KEY_V1 = "primary_v1" as const;
 export const WEIGHTS_KEY_V2 = "primary_v2" as const;
 export const SETTINGS_KEY_V2 = "current_v2" as const;
+export const IDB_RECOVERY_COOLDOWN_MS = 5_000 as const;
 
 const LANG_BIAS_KEYS: ReadonlyArray<LangBiasKey> = ["en", "zh-Hans", "zh-Hant", "ja", "other"];
 const MAX_UNDO_HISTORY_ENTRIES = 32 as const;
@@ -412,6 +413,18 @@ interface StoredWeightsPayloadV2 {
   readonly recordedAutoFlagIds: ReadonlyArray<TweetId>;
   readonly undoHistory: ReadonlyArray<UndoRecord>;
   readonly weightsRevision?: number | undefined;
+  readonly dimsReviewedCount?: number | undefined;
+  readonly dimsOverriddenHumanCount?: number | undefined;
+}
+
+export interface PersistenceHealth {
+  readonly degraded: boolean;
+  readonly settingsDegraded: boolean;
+  readonly lastError: string | null;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function deserializeAuthorStats(
@@ -553,22 +566,153 @@ function toFloat32Vector(raw: unknown, expectedLen: number): Float32Array | null
   return null;
 }
 
+function areFilterSettingsEqual(a: FilterSettings, b: FilterSettings): boolean {
+  return (
+    a.preset === b.preset &&
+    a.revision === b.revision &&
+    a.toggles.collapseBlueCheckReplyGuys === b.toggles.collapseBlueCheckReplyGuys &&
+    a.toggles.collapseMediaOnlyReplies === b.toggles.collapseMediaOnlyReplies &&
+    a.toggles.collapseBotSummons === b.toggles.collapseBotSummons &&
+    a.toggles.showSuspectBadges === b.toggles.showSuspectBadges &&
+    a.toggles.learnFromFeedback === b.toggles.learnFromFeedback &&
+    a.toggles.enableStage2 === b.toggles.enableStage2
+  );
+}
+
+function mergeDegradedWeightsIntoLoaded(
+  loaded: OnlineClassifierWeights,
+  degraded: OnlineClassifierWeights,
+): OnlineClassifierWeights {
+  const mergedAuthors = new Map<AuthorId, AuthorStats>(loaded.authorStats);
+  for (const [id, mem] of degraded.authorStats.entries()) {
+    const prev = mergedAuthors.get(id);
+    if (prev === undefined) {
+      mergedAuthors.set(id, mem);
+    } else {
+      const mergedLastUpdated =
+        prev.lastUpdatedAtMs !== undefined && mem.lastUpdatedAtMs !== undefined
+          ? Math.max(prev.lastUpdatedAtMs, mem.lastUpdatedAtMs)
+          : (mem.lastUpdatedAtMs ?? prev.lastUpdatedAtMs);
+      const mergedDecayed =
+        (prev.autoFlagDecayed ?? prev.autoFlagCount) +
+        (mem.autoFlagDecayed ?? mem.autoFlagCount);
+      mergedAuthors.set(id, {
+        spamCount: prev.spamCount + mem.spamCount,
+        humanCount: prev.humanCount + mem.humanCount,
+        autoFlagCount: prev.autoFlagCount + mem.autoFlagCount,
+        ...(mergedLastUpdated !== undefined ? { lastUpdatedAtMs: mergedLastUpdated } : {}),
+        autoFlagDecayed: mergedDecayed,
+      });
+    }
+  }
+
+  let mergedReplay: FeedbackReplayEntry[] = [...(loaded.replayBuffer ?? [])];
+  const degradedReplay = degraded.replayBuffer ?? [];
+  for (const entry of degradedReplay) {
+    mergedReplay = insertIntoReplayBuffer(mergedReplay, entry, MAX_REPLAY_BUFFER_ENTRIES);
+  }
+
+  const mergedAutoFlags = new Set<TweetId>(loaded.recordedAutoFlagIds ?? []);
+  for (const tid of degraded.recordedAutoFlagIds ?? []) {
+    if (mergedAutoFlags.size >= MAX_AUTO_FLAGGED_TWEET_IDS && !mergedAutoFlags.has(tid)) {
+      const oldest = mergedAutoFlags.values().next().value;
+      if (oldest !== undefined) mergedAutoFlags.delete(oldest);
+    }
+    mergedAutoFlags.add(tid);
+  }
+
+  const mergedUndo = [
+    ...(loaded.undoHistory ?? []),
+    ...(degraded.undoHistory ?? []),
+  ].slice(-MAX_UNDO_HISTORY_ENTRIES);
+
+  const dimsReviewedCount =
+    (loaded.dimsReviewedCount ?? 0) + (degraded.dimsReviewedCount ?? 0);
+  const dimsOverriddenHumanCount =
+    (loaded.dimsOverriddenHumanCount ?? 0) + (degraded.dimsOverriddenHumanCount ?? 0);
+  const updateCount = loaded.updateCount + degraded.updateCount;
+  const weightsRevision = Math.max(loaded.weightsRevision ?? 1, degraded.weightsRevision ?? 1) + 1;
+
+  const baseMerged: OnlineClassifierWeights = {
+    ...loaded,
+    authorStats: mergedAuthors,
+    replayBuffer: mergedReplay,
+    recordedAutoFlagIds: mergedAutoFlags,
+    undoHistory: mergedUndo,
+    updateCount,
+    rollbackCount: (loaded.rollbackCount ?? 0) + (degraded.rollbackCount ?? 0),
+    weightsRevision,
+    dimsReviewedCount,
+    dimsOverriddenHumanCount,
+  };
+
+  if (degradedReplay.length > 0 && mergedReplay.length > 0) {
+    const retrained = trainFromReplayBuffer(baseMerged, mergedReplay);
+    return {
+      ...retrained.nextWeights,
+      authorStats: mergedAuthors,
+      recordedAutoFlagIds: mergedAutoFlags,
+      undoHistory: mergedUndo,
+      updateCount,
+      weightsRevision,
+      dimsReviewedCount,
+      dimsOverriddenHumanCount,
+    };
+  }
+
+  return baseMerged;
+}
+
 export class IndexedDbWeightStore {
   private memoryFallback: OnlineClassifierWeights | null = null;
+  private weightsLoaded = false;
+  private weightsLoadPromise: Promise<OnlineClassifierWeights> | null = null;
+  private weightsMutationSeq = 0;
+  private weightsResetEpoch = 0;
+  private weightsPersistenceDegraded = false;
+  private nextWeightsRetryAtMs = 0;
+  private degradedWeightsMutated = false;
+  private lastPersistedReplayRef: ReadonlyArray<FeedbackReplayEntry> | null = null;
+
   private settingsFallback: FilterSettings | null = null;
+  private settingsLoaded = false;
+  private settingsLoadPromise: Promise<FilterSettings> | null = null;
+  private settingsMutationSeq = 0;
+  private settingsPersistenceDegraded = false;
+  private nextSettingsRetryAtMs = 0;
+  private degradedSettingsMutated = false;
+
+  private lastPersistenceError: string | null = null;
   private preservedV1Legacy: { readonly weights: Float32Array; readonly bias: number } | null =
     null;
   private readonly dbName: string;
   private readonly idbFactory: IDBFactory | null;
+  private readonly nowFn: () => number;
+  private readonly retryCooldownMs: number;
   private writeChain: Promise<void> = Promise.resolve();
 
-  constructor(dbName: string = DB_NAME, idbFactory?: IDBFactory | null) {
+  constructor(
+    dbName: string = DB_NAME,
+    idbFactory?: IDBFactory | null,
+    nowFn: () => number = () => Date.now(),
+    retryCooldownMs: number = IDB_RECOVERY_COOLDOWN_MS,
+  ) {
     this.dbName = dbName;
     if (idbFactory !== undefined) {
       this.idbFactory = idbFactory;
     } else {
       this.idbFactory = typeof indexedDB !== "undefined" ? indexedDB : null;
     }
+    this.nowFn = nowFn;
+    this.retryCooldownMs = Math.max(0, retryCooldownMs);
+  }
+
+  public getPersistenceHealth(): PersistenceHealth {
+    return {
+      degraded: this.weightsPersistenceDegraded,
+      settingsDegraded: this.settingsPersistenceDegraded,
+      lastError: this.lastPersistenceError,
+    };
   }
 
   private openDatabase(): Promise<IDBDatabase> {
@@ -591,23 +735,18 @@ export class IndexedDbWeightStore {
         }
       };
       req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onerror = () => reject(req.error ?? new Error("IndexedDB open failed"));
     });
   }
 
-  public async getWeights(): Promise<OnlineClassifierWeights> {
-    if (this.memoryFallback !== null) {
-      return this.memoryFallback;
-    }
-
-    if (this.idbFactory === null) {
-      this.memoryFallback = createInitialClassifierWeights();
-      return this.memoryFallback;
-    }
+  private async readWeightsFromIdbOnce(): Promise<OnlineClassifierWeights> {
+    const db = await this.openDatabase();
+    let v1Payload: StoredWeightsPayloadV1 | undefined;
+    let v2Payload: StoredWeightsPayloadV2 | undefined;
+    let rawReplay: ReadonlyArray<unknown> = [];
 
     try {
-      const db = await this.openDatabase();
-      const { v1Payload, v2Payload, rawReplay } = await new Promise<{
+      const res = await new Promise<{
         readonly v1Payload: StoredWeightsPayloadV1 | undefined;
         readonly v2Payload: StoredWeightsPayloadV2 | undefined;
         readonly rawReplay: ReadonlyArray<unknown>;
@@ -630,13 +769,16 @@ export class IndexedDbWeightStore {
         v1Req.onsuccess = () => {
           v1Res = v1Req.result as StoredWeightsPayloadV1 | undefined;
         };
+        v1Req.onerror = () => reject(v1Req.error ?? new Error("primary_v1 read failed"));
         v2Req.onsuccess = () => {
           v2Res = v2Req.result as StoredWeightsPayloadV2 | undefined;
         };
+        v2Req.onerror = () => reject(v2Req.error ?? new Error("primary_v2 read failed"));
         if (replayReq !== null) {
           replayReq.onsuccess = () => {
             replayRes = Array.isArray(replayReq.result) ? replayReq.result : [];
           };
+          replayReq.onerror = () => reject(replayReq.error ?? new Error("replay read failed"));
         }
 
         tx.oncomplete = () =>
@@ -645,238 +787,412 @@ export class IndexedDbWeightStore {
             v2Payload: v2Res,
             rawReplay: replayRes,
           });
-        tx.onerror = () => reject(tx.error);
+        tx.onerror = () => reject(tx.error ?? new Error("IndexedDB read error"));
         tx.onabort = () => reject(tx.error ?? new Error("IndexedDB read aborted"));
       });
+      v1Payload = res.v1Payload;
+      v2Payload = res.v2Payload;
+      rawReplay = res.rawReplay;
+    } finally {
       db.close();
+    }
 
-      const defaults = createInitialClassifierWeights();
+    const defaults = createInitialClassifierWeights();
 
-      // Preserve untouched v1 778d weights for future dual-write compatibility (NEVER delete primary_v1)
-      let legacyWeights = defaults.weights;
-      let legacyBias = defaults.bias;
-      if (v1Payload && v1Payload.weights instanceof Float32Array) {
-        const migratedLegacy = new Float32Array(defaults.weights);
-        const copyLen = Math.min(v1Payload.weights.length, SIAMESE_TOTAL_DIM);
-        for (let i = 0; i < copyLen; i++) {
-          migratedLegacy[i] = v1Payload.weights[i]!;
-        }
-        legacyWeights = migratedLegacy;
-        legacyBias = typeof v1Payload.bias === "number" ? v1Payload.bias : defaults.bias;
-        this.preservedV1Legacy = {
-          weights: new Float32Array(v1Payload.weights),
-          bias: legacyBias,
-        };
+    // Preserve untouched v1 778d weights for future dual-write compatibility (NEVER delete primary_v1)
+    let legacyWeights = defaults.weights;
+    let legacyBias = defaults.bias;
+    if (v1Payload && v1Payload.weights instanceof Float32Array) {
+      const migratedLegacy = new Float32Array(defaults.weights);
+      const copyLen = Math.min(v1Payload.weights.length, SIAMESE_TOTAL_DIM);
+      for (let i = 0; i < copyLen; i++) {
+        migratedLegacy[i] = v1Payload.weights[i]!;
       }
+      legacyWeights = migratedLegacy;
+      legacyBias = typeof v1Payload.bias === "number" ? v1Payload.bias : defaults.bias;
+      this.preservedV1Legacy = {
+        weights: new Float32Array(v1Payload.weights),
+        bias: legacyBias,
+      };
+    }
 
-      // Lossless authorStats merge: start with primary_v1, overlay primary_v2
-      // (preserving higher counts if primary_v1 advanced during a v1 downgrade session)
-      const mergedAuthors = deserializeAuthorStats(v1Payload?.authorStatsEntries);
-      if (v2Payload && v2Payload.schemaVersion === 2) {
-        const v2Authors = deserializeAuthorStats(v2Payload.authorStatsEntries);
-        for (const [id, stats] of v2Authors.entries()) {
-          const prevV1 = mergedAuthors.get(id);
-          if (
-            prevV1 !== undefined &&
-            (prevV1.spamCount > stats.spamCount ||
-              prevV1.humanCount > stats.humanCount ||
-              prevV1.autoFlagCount > stats.autoFlagCount)
-          ) {
-            mergedAuthors.set(id, {
-              ...stats,
-              spamCount: Math.max(prevV1.spamCount, stats.spamCount),
-              humanCount: Math.max(prevV1.humanCount, stats.humanCount),
-              autoFlagCount: Math.max(prevV1.autoFlagCount, stats.autoFlagCount),
-            });
-          } else {
-            mergedAuthors.set(id, stats);
-          }
-        }
-      }
-
-      const replayBuffer = deserializeReplayEntries(rawReplay);
-
-      if (v2Payload && v2Payload.schemaVersion === 2) {
-        const recordedAutoFlagIds = deserializeAutoFlagIds(v2Payload.recordedAutoFlagIds);
-        const undoHistory = Array.isArray(v2Payload.undoHistory)
-          ? (v2Payload.undoHistory.slice(-MAX_UNDO_HISTORY_ENTRIES) as UndoRecord[])
-          : [];
-        const updateCount = Math.max(
-          0,
-          Math.floor(v2Payload.updateCount ?? v1Payload?.updateCount ?? 0),
-        );
-        const rollbackCount = Math.max(0, Math.floor(v2Payload.rollbackCount ?? 0));
-        const weightsRevision = Math.max(1, Math.floor(v2Payload.weightsRevision ?? 1));
-
-        const parsedTheta = toFloat32Vector(v2Payload.theta, COMPACT_V2_DIM);
-        const parsedLangBias = deserializeLangBias(v2Payload.langBias, defaults.langBias!);
-
-        if (v2Payload.theta0Hash === defaults.theta0Hash && parsedTheta !== null) {
-          this.memoryFallback = {
-            ...defaults,
-            weights: legacyWeights,
-            bias: legacyBias,
-            authorStats: mergedAuthors,
-            theta: parsedTheta,
-            langBias: parsedLangBias,
-            replayBuffer,
-            updateCount,
-            rollbackCount,
-            weightsRevision,
-            recordedAutoFlagIds,
-            undoHistory,
-          };
+    // Lossless authorStats merge: start with primary_v1, overlay primary_v2
+    // (preserving higher counts if primary_v1 advanced during a v1 downgrade session)
+    const mergedAuthors = deserializeAuthorStats(v1Payload?.authorStatsEntries);
+    if (v2Payload && v2Payload.schemaVersion === 2) {
+      const v2Authors = deserializeAuthorStats(v2Payload.authorStatsEntries);
+      for (const [id, stats] of v2Authors.entries()) {
+        const prevV1 = mergedAuthors.get(id);
+        if (
+          prevV1 !== undefined &&
+          (prevV1.spamCount > stats.spamCount ||
+            prevV1.humanCount > stats.humanCount ||
+            prevV1.autoFlagCount > stats.autoFlagCount)
+        ) {
+          mergedAuthors.set(id, {
+            ...stats,
+            spamCount: Math.max(prevV1.spamCount, stats.spamCount),
+            humanCount: Math.max(prevV1.humanCount, stats.humanCount),
+            autoFlagCount: Math.max(prevV1.autoFlagCount, stats.autoFlagCount),
+          });
         } else {
-          // Shipped theta0 changed: re-anchor cleanly on defaults.theta0 and replay stored user labels
-          const reanchoredBase: OnlineClassifierWeights = {
-            ...defaults,
-            weights: legacyWeights,
-            bias: legacyBias,
-            authorStats: mergedAuthors,
-            replayBuffer,
-            updateCount,
-            rollbackCount,
-            weightsRevision,
-            recordedAutoFlagIds,
-            undoHistory,
-          };
-          if (replayBuffer.length > 0) {
-            const retrained = trainFromReplayBuffer(reanchoredBase, replayBuffer);
-            this.memoryFallback = {
-              ...retrained.nextWeights,
-              updateCount,
-            };
-          } else {
-            this.memoryFallback = reanchoredBase;
-          }
+          mergedAuthors.set(id, stats);
         }
-      } else if (v1Payload) {
-        // First upgrade from v1 -> v2: keep all authorStats + updateCount from primary_v1,
-        // score with calibrated v2 head (never topic-contaminated v1 778d weights).
-        this.memoryFallback = {
+      }
+    }
+
+    const replayBuffer = deserializeReplayEntries(rawReplay);
+    this.lastPersistedReplayRef = replayBuffer;
+
+    if (v2Payload && v2Payload.schemaVersion === 2) {
+      const recordedAutoFlagIds = deserializeAutoFlagIds(v2Payload.recordedAutoFlagIds);
+      const undoHistory = Array.isArray(v2Payload.undoHistory)
+        ? (v2Payload.undoHistory.slice(-MAX_UNDO_HISTORY_ENTRIES) as UndoRecord[])
+        : [];
+      const updateCount = Math.max(
+        0,
+        Math.floor(v2Payload.updateCount ?? v1Payload?.updateCount ?? 0),
+      );
+      const rollbackCount = Math.max(0, Math.floor(v2Payload.rollbackCount ?? 0));
+      const weightsRevision = Math.max(1, Math.floor(v2Payload.weightsRevision ?? 1));
+      const dimsReviewedCount =
+        typeof v2Payload.dimsReviewedCount === "number" &&
+        Number.isFinite(v2Payload.dimsReviewedCount)
+          ? Math.max(0, Math.floor(v2Payload.dimsReviewedCount))
+          : 0;
+      const dimsOverriddenHumanCount =
+        typeof v2Payload.dimsOverriddenHumanCount === "number" &&
+        Number.isFinite(v2Payload.dimsOverriddenHumanCount)
+          ? Math.max(0, Math.floor(v2Payload.dimsOverriddenHumanCount))
+          : 0;
+
+      const parsedTheta = toFloat32Vector(v2Payload.theta, COMPACT_V2_DIM);
+      const parsedLangBias = deserializeLangBias(v2Payload.langBias, defaults.langBias!);
+
+      if (v2Payload.theta0Hash === defaults.theta0Hash && parsedTheta !== null) {
+        return {
           ...defaults,
           weights: legacyWeights,
           bias: legacyBias,
-          updateCount: Math.max(0, Math.floor(v1Payload.updateCount ?? 0)),
           authorStats: mergedAuthors,
+          theta: parsedTheta,
+          langBias: parsedLangBias,
           replayBuffer,
+          updateCount,
+          rollbackCount,
+          weightsRevision,
+          recordedAutoFlagIds,
+          undoHistory,
+          dimsReviewedCount,
+          dimsOverriddenHumanCount,
         };
-      } else {
-        this.memoryFallback = defaults;
       }
 
-      return this.memoryFallback;
-    } catch {
-      this.memoryFallback = createInitialClassifierWeights();
+      // Shipped theta0 changed: re-anchor cleanly on defaults.theta0 and replay stored user labels
+      const reanchoredBase: OnlineClassifierWeights = {
+        ...defaults,
+        weights: legacyWeights,
+        bias: legacyBias,
+        authorStats: mergedAuthors,
+        replayBuffer,
+        updateCount,
+        rollbackCount,
+        weightsRevision,
+        recordedAutoFlagIds,
+        undoHistory,
+        dimsReviewedCount,
+        dimsOverriddenHumanCount,
+      };
+      if (replayBuffer.length > 0) {
+        const retrained = trainFromReplayBuffer(reanchoredBase, replayBuffer);
+        return {
+          ...retrained.nextWeights,
+          updateCount,
+          dimsReviewedCount,
+          dimsOverriddenHumanCount,
+        };
+      }
+      return reanchoredBase;
+    }
+
+    if (v1Payload) {
+      // First upgrade from v1 -> v2: keep all authorStats + updateCount from primary_v1,
+      // score with calibrated v2 head (never topic-contaminated v1 778d weights).
+      return {
+        ...defaults,
+        weights: legacyWeights,
+        bias: legacyBias,
+        updateCount: Math.max(0, Math.floor(v1Payload.updateCount ?? 0)),
+        authorStats: mergedAuthors,
+        replayBuffer,
+      };
+    }
+
+    return defaults;
+  }
+
+  private enqueuePersistWeights(
+    weights: OnlineClassifierWeights,
+    expectedSeq: number,
+    options?: {
+      readonly forceReplayWrite?: boolean;
+      readonly allowWhileDegraded?: boolean;
+      readonly clearDegradedOnSuccess?: boolean;
+    },
+  ): Promise<void> {
+    const run = async (): Promise<void> => {
+      if (this.weightsMutationSeq !== expectedSeq) {
+        return;
+      }
+      if (this.weightsPersistenceDegraded && options?.allowWhileDegraded !== true) {
+        return;
+      }
+      try {
+        await this.persistWeightsToIdb(weights, options);
+        if (options?.clearDegradedOnSuccess && this.weightsMutationSeq === expectedSeq) {
+          this.weightsPersistenceDegraded = false;
+          this.nextWeightsRetryAtMs = 0;
+          this.degradedWeightsMutated = false;
+          this.weightsLoaded = true;
+        }
+      } catch (err) {
+        this.lastPersistenceError = `IndexedDB weights write failed: ${errorMessage(err)}`;
+        console.warn("[x-reply-filter] IndexedDB weights write failed:", err);
+      }
+    };
+
+    const next = this.writeChain.then(run, run);
+    this.writeChain = next;
+    return next;
+  }
+
+  public async getWeights(): Promise<OnlineClassifierWeights> {
+    if (this.weightsLoaded && this.memoryFallback !== null) {
       return this.memoryFallback;
     }
+    if (this.weightsLoadPromise !== null) {
+      return this.weightsLoadPromise;
+    }
+
+    if (this.idbFactory === null) {
+      this.memoryFallback = this.memoryFallback ?? createInitialClassifierWeights();
+      this.weightsLoaded = true;
+      return this.memoryFallback;
+    }
+
+    // Gate recovery retries while degraded with a cooldown so broken IDB isn't hammered
+    if (this.weightsPersistenceDegraded && this.nowFn() < this.nextWeightsRetryAtMs) {
+      this.memoryFallback = this.memoryFallback ?? createInitialClassifierWeights();
+      return this.memoryFallback;
+    }
+
+    const wasDegraded = this.weightsPersistenceDegraded;
+    const seqBefore = this.weightsMutationSeq;
+    const resetEpochBefore = this.weightsResetEpoch;
+    const maxAttempts = wasDegraded ? 1 : 2;
+
+    const loadPromise = (async (): Promise<OnlineClassifierWeights> => {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const loaded = await this.readWeightsFromIdbOnce();
+          // If an explicit reset occurred while reading, keep reset state untouched
+          if (this.weightsResetEpoch !== resetEpochBefore && this.memoryFallback !== null) {
+            return this.memoryFallback;
+          }
+
+          this.weightsPersistenceDegraded = false;
+          this.nextWeightsRetryAtMs = 0;
+          this.weightsLoaded = true;
+
+          if (wasDegraded && this.degradedWeightsMutated && this.memoryFallback !== null) {
+            // Reconcile session mutations accumulated while degraded into recovered disk state
+            const merged = mergeDegradedWeightsIntoLoaded(loaded, this.memoryFallback);
+            this.degradedWeightsMutated = false;
+            const mergedSeq = ++this.weightsMutationSeq;
+            this.memoryFallback = merged;
+            await this.enqueuePersistWeights(merged, mergedSeq, { forceReplayWrite: true });
+            return this.memoryFallback;
+          }
+
+          this.degradedWeightsMutated = false;
+          if (!wasDegraded && (this.weightsMutationSeq > 0 || this.weightsMutationSeq !== seqBefore) && this.memoryFallback !== null) {
+            // Caller already wrote newer weights before/during cold load; keep them while preserving preservedV1Legacy
+            return this.memoryFallback;
+          }
+
+          this.memoryFallback = loaded;
+          return this.memoryFallback;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      // If an explicit reset succeeded while this read was failing, do not re-enter degraded mode
+      if (this.weightsResetEpoch !== resetEpochBefore && this.memoryFallback !== null) {
+        return this.memoryFallback;
+      }
+
+      // CRITICAL: Never treat fallback defaults as persisted state. Keep weightsLoaded = false
+      // with a recovery cooldown so writes stay blocked until a real read succeeds, while
+      // allowing automatic recovery once IndexedDB becomes available again.
+      this.weightsPersistenceDegraded = true;
+      this.nextWeightsRetryAtMs = this.nowFn() + this.retryCooldownMs;
+      this.lastPersistenceError = `IndexedDB weights read failed: ${errorMessage(lastErr)}`;
+      console.warn(
+        "[x-reply-filter] IndexedDB weights read failed; disabling persistence writes to protect stored author memory:",
+        lastErr,
+      );
+      if (this.memoryFallback === null) {
+        this.memoryFallback = createInitialClassifierWeights();
+      }
+      return this.memoryFallback;
+    })().finally(() => {
+      this.weightsLoadPromise = null;
+    });
+
+    this.weightsLoadPromise = loadPromise;
+    return loadPromise;
   }
 
   public async setSeedPrototypes(prototypes: ReadonlyArray<SeedPrototype>): Promise<void> {
     const current = await this.getWeights();
+    this.weightsMutationSeq += 1;
     this.memoryFallback = {
       ...current,
       seedPrototypes: prototypes,
     };
   }
 
+  private async persistWeightsToIdb(
+    weights: OnlineClassifierWeights,
+    options?: { readonly forceReplayWrite?: boolean },
+  ): Promise<boolean> {
+    const db = await this.openDatabase();
+    try {
+      const defaults = createInitialClassifierWeights();
+      const authorStatsEntries = Array.from(weights.authorStats.entries());
+      const theta =
+        weights.theta && weights.theta.length === COMPACT_V2_DIM
+          ? new Float32Array(weights.theta)
+          : new Float32Array(defaults.theta0!);
+      const lb = weights.langBias ?? defaults.langBias!;
+      const langBias: Record<LangBiasKey, number> = {
+        en: lb.en,
+        "zh-Hans": lb["zh-Hans"],
+        "zh-Hant": lb["zh-Hant"],
+        ja: lb.ja,
+        other: lb.other,
+      };
+
+      const v1Payload: StoredWeightsPayloadV1 = {
+        weights: this.preservedV1Legacy?.weights ?? weights.weights,
+        bias: this.preservedV1Legacy?.bias ?? weights.bias,
+        updateCount: weights.updateCount,
+        authorStatsEntries,
+      };
+
+      const v2Payload: StoredWeightsPayloadV2 = {
+        schemaVersion: 2,
+        theta,
+        langBias,
+        theta0Hash: weights.theta0Hash ?? defaults.theta0Hash!,
+        updateCount: weights.updateCount,
+        rollbackCount: weights.rollbackCount ?? 0,
+        authorStatsEntries,
+        recordedAutoFlagIds: Array.from(weights.recordedAutoFlagIds ?? []).slice(
+          -MAX_AUTO_FLAGGED_TWEET_IDS,
+        ),
+        undoHistory: (weights.undoHistory ?? []).slice(-MAX_UNDO_HISTORY_ENTRIES),
+        weightsRevision: weights.weightsRevision ?? 1,
+        ...(weights.dimsReviewedCount !== undefined
+          ? { dimsReviewedCount: weights.dimsReviewedCount }
+          : {}),
+        ...(weights.dimsOverriddenHumanCount !== undefined
+          ? { dimsOverriddenHumanCount: weights.dimsOverriddenHumanCount }
+          : {}),
+      };
+
+      const currentReplay = weights.replayBuffer ?? [];
+      const shouldWriteReplay =
+        options?.forceReplayWrite === true || currentReplay !== this.lastPersistedReplayRef;
+      const replaySlice = shouldWriteReplay
+        ? currentReplay.slice(-MAX_REPLAY_BUFFER_ENTRIES)
+        : [];
+
+      await new Promise<void>((resolve, reject) => {
+        const hasReplayStore = db.objectStoreNames.contains(REPLAY_STORE_NAME);
+        const storeNames =
+          shouldWriteReplay && hasReplayStore ? [STORE_NAME, REPLAY_STORE_NAME] : [STORE_NAME];
+        const tx = db.transaction(storeNames, "readwrite");
+        const wStore = tx.objectStore(STORE_NAME);
+        // Dual-write primary_v1 (compat, never deleted) AND primary_v2
+        wStore.put(v1Payload, WEIGHTS_KEY_V1);
+        wStore.put(v2Payload, WEIGHTS_KEY_V2);
+
+        if (shouldWriteReplay && hasReplayStore) {
+          const rStore = tx.objectStore(REPLAY_STORE_NAME);
+          rStore.clear();
+          for (const entry of replaySlice) {
+            rStore.put(
+              {
+                ...entry,
+                z: Array.from(entry.z),
+              },
+              entry.tweetId,
+            );
+          }
+        }
+
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error ?? new Error("IndexedDB write error"));
+        tx.onabort = () => reject(tx.error ?? new Error("IndexedDB write aborted"));
+      });
+
+      if (shouldWriteReplay) {
+        this.lastPersistedReplayRef = currentReplay;
+      }
+      return true;
+    } finally {
+      db.close();
+    }
+  }
+
   public async saveWeights(weights: OnlineClassifierWeights): Promise<void> {
+    const mySeq = ++this.weightsMutationSeq;
     this.memoryFallback = weights;
+    if (this.weightsPersistenceDegraded) {
+      this.degradedWeightsMutated = true;
+    }
     if (this.idbFactory === null) {
       return;
     }
 
-    const run = async (): Promise<void> => {
-      try {
-        const db = await this.openDatabase();
-        const defaults = createInitialClassifierWeights();
-        const authorStatsEntries = Array.from(weights.authorStats.entries());
-        const theta =
-          weights.theta && weights.theta.length === COMPACT_V2_DIM
-            ? new Float32Array(weights.theta)
-            : new Float32Array(defaults.theta0!);
-        const lb = weights.langBias ?? defaults.langBias!;
-        const langBias: Record<LangBiasKey, number> = {
-          en: lb.en,
-          "zh-Hans": lb["zh-Hans"],
-          "zh-Hant": lb["zh-Hant"],
-          ja: lb.ja,
-          other: lb.other,
-        };
+    // Ensure initial load (or post-cooldown recovery) runs first so preservedV1Legacy & degraded guard are accurate
+    if (!this.weightsLoaded) {
+      if (this.weightsLoadPromise !== null) {
+        await this.weightsLoadPromise;
+      } else if (!this.weightsPersistenceDegraded || this.nowFn() >= this.nextWeightsRetryAtMs) {
+        await this.getWeights();
+      }
+    }
 
-        const v1Payload: StoredWeightsPayloadV1 = {
-          weights: this.preservedV1Legacy?.weights ?? weights.weights,
-          bias: this.preservedV1Legacy?.bias ?? weights.bias,
-          updateCount: weights.updateCount,
-          authorStatsEntries,
-        };
+    // Bail if superseded by a newer mutation, explicit reset, or recovery merge
+    if (this.weightsMutationSeq !== mySeq) {
+      return;
+    }
 
-        const v2Payload: StoredWeightsPayloadV2 = {
-          schemaVersion: 2,
-          theta,
-          langBias,
-          theta0Hash: weights.theta0Hash ?? defaults.theta0Hash!,
-          updateCount: weights.updateCount,
-          rollbackCount: weights.rollbackCount ?? 0,
-          authorStatsEntries,
-          recordedAutoFlagIds: Array.from(weights.recordedAutoFlagIds ?? []).slice(
-            -MAX_AUTO_FLAGGED_TWEET_IDS,
-          ),
-          undoHistory: (weights.undoHistory ?? []).slice(-MAX_UNDO_HISTORY_ENTRIES),
-          weightsRevision: weights.weightsRevision ?? 1,
-        };
+    if (this.weightsPersistenceDegraded) {
+      this.degradedWeightsMutated = true;
+      return;
+    }
 
-        const replaySlice = (weights.replayBuffer ?? []).slice(-MAX_REPLAY_BUFFER_ENTRIES);
-
-        await new Promise<void>((resolve, reject) => {
-          const storeNames = db.objectStoreNames.contains(REPLAY_STORE_NAME)
-            ? [STORE_NAME, REPLAY_STORE_NAME]
-            : [STORE_NAME];
-          const tx = db.transaction(storeNames, "readwrite");
-          const wStore = tx.objectStore(STORE_NAME);
-          // Dual-write primary_v1 (compat, never deleted) AND primary_v2
-          wStore.put(v1Payload, WEIGHTS_KEY_V1);
-          wStore.put(v2Payload, WEIGHTS_KEY_V2);
-
-          if (db.objectStoreNames.contains(REPLAY_STORE_NAME)) {
-            const rStore = tx.objectStore(REPLAY_STORE_NAME);
-            rStore.clear();
-            for (const entry of replaySlice) {
-              rStore.put(
-                {
-                  ...entry,
-                  z: Array.from(entry.z),
-                },
-                entry.tweetId,
-              );
-            }
-          }
-
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
-          tx.onabort = () => reject(tx.error ?? new Error("IndexedDB write aborted"));
-        });
-        db.close();
-      } catch {}
-    };
-
-    const next = this.writeChain.then(run, run);
-    this.writeChain = next;
-    await next;
+    await this.enqueuePersistWeights(weights, mySeq);
   }
 
-  public async getSettings(): Promise<FilterSettings> {
-    if (this.settingsFallback !== null) {
-      return this.settingsFallback;
-    }
-
-    if (this.idbFactory === null) {
-      this.settingsFallback = DEFAULT_FILTER_SETTINGS;
-      return this.settingsFallback;
-    }
-
+  private async readSettingsFromIdbOnce(): Promise<FilterSettings> {
+    const db = await this.openDatabase();
     try {
-      const db = await this.openDatabase();
       const raw = await new Promise<unknown>((resolve, reject) => {
         if (!db.objectStoreNames.contains(SETTINGS_STORE_NAME)) {
           resolve(undefined);
@@ -886,43 +1202,154 @@ export class IndexedDbWeightStore {
         const store = tx.objectStore(SETTINGS_STORE_NAME);
         const getReq = store.get(SETTINGS_KEY_V2);
         getReq.onsuccess = () => resolve(getReq.result);
-        getReq.onerror = () => reject(getReq.error);
+        getReq.onerror = () => reject(getReq.error ?? new Error("settings read failed"));
+        tx.onerror = () => reject(tx.error ?? new Error("settings tx error"));
+        tx.onabort = () => reject(tx.error ?? new Error("settings tx aborted"));
       });
+      return parseFilterSettings(raw) ?? DEFAULT_FILTER_SETTINGS;
+    } finally {
       db.close();
-
-      const parsed = parseFilterSettings(raw);
-      this.settingsFallback = parsed ?? DEFAULT_FILTER_SETTINGS;
-      return this.settingsFallback;
-    } catch {
-      this.settingsFallback = DEFAULT_FILTER_SETTINGS;
-      return this.settingsFallback;
     }
   }
 
-  public async saveSettings(settings: FilterSettings): Promise<void> {
-    this.settingsFallback = settings;
-    if (this.idbFactory === null) {
-      return;
-    }
-
+  private enqueuePersistSettings(settings: FilterSettings, expectedSeq: number): Promise<void> {
     const run = async (): Promise<void> => {
+      if (this.settingsMutationSeq !== expectedSeq || this.settingsPersistenceDegraded) {
+        return;
+      }
       try {
         const db = await this.openDatabase();
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(SETTINGS_STORE_NAME, "readwrite");
-          const store = tx.objectStore(SETTINGS_STORE_NAME);
-          store.put(settings, SETTINGS_KEY_V2);
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
-          tx.onabort = () => reject(tx.error ?? new Error("IndexedDB settings write aborted"));
-        });
-        db.close();
-      } catch {}
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction(SETTINGS_STORE_NAME, "readwrite");
+            const store = tx.objectStore(SETTINGS_STORE_NAME);
+            store.put(settings, SETTINGS_KEY_V2);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error ?? new Error("settings write error"));
+            tx.onabort = () => reject(tx.error ?? new Error("IndexedDB settings write aborted"));
+          });
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        this.lastPersistenceError = `IndexedDB settings write failed: ${errorMessage(err)}`;
+        console.warn("[x-reply-filter] IndexedDB settings write failed:", err);
+      }
     };
 
     const next = this.writeChain.then(run, run);
     this.writeChain = next;
-    await next;
+    return next;
+  }
+
+  public async getSettings(): Promise<FilterSettings> {
+    if (this.settingsLoaded && this.settingsFallback !== null) {
+      return this.settingsFallback;
+    }
+    if (this.settingsLoadPromise !== null) {
+      return this.settingsLoadPromise;
+    }
+
+    if (this.idbFactory === null) {
+      this.settingsFallback = this.settingsFallback ?? DEFAULT_FILTER_SETTINGS;
+      this.settingsLoaded = true;
+      return this.settingsFallback;
+    }
+
+    if (this.settingsPersistenceDegraded && this.nowFn() < this.nextSettingsRetryAtMs) {
+      this.settingsFallback = this.settingsFallback ?? DEFAULT_FILTER_SETTINGS;
+      return this.settingsFallback;
+    }
+
+    const wasDegraded = this.settingsPersistenceDegraded;
+    const seqBefore = this.settingsMutationSeq;
+    const maxAttempts = wasDegraded ? 1 : 2;
+
+    const loadPromise = (async (): Promise<FilterSettings> => {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const loaded = await this.readSettingsFromIdbOnce();
+          this.settingsPersistenceDegraded = false;
+          this.nextSettingsRetryAtMs = 0;
+          this.settingsLoaded = true;
+
+          if (wasDegraded && this.degradedSettingsMutated && this.settingsFallback !== null) {
+            this.degradedSettingsMutated = false;
+            if (this.settingsFallback.revision > loaded.revision) {
+              const keepSeq = ++this.settingsMutationSeq;
+              await this.enqueuePersistSettings(this.settingsFallback, keepSeq);
+              return this.settingsFallback;
+            }
+            this.settingsFallback = loaded;
+            return this.settingsFallback;
+          }
+
+          this.degradedSettingsMutated = false;
+          if (
+            !wasDegraded &&
+            (this.settingsMutationSeq > 0 || this.settingsMutationSeq !== seqBefore) &&
+            this.settingsFallback !== null
+          ) {
+            return this.settingsFallback;
+          }
+
+          this.settingsFallback = loaded;
+          return this.settingsFallback;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      // Leave settingsLoaded = false with a cooldown so recovery succeeds once IDB returns
+      this.settingsPersistenceDegraded = true;
+      this.nextSettingsRetryAtMs = this.nowFn() + this.retryCooldownMs;
+      this.lastPersistenceError = `IndexedDB settings read failed: ${errorMessage(lastErr)}`;
+      console.warn(
+        "[x-reply-filter] IndexedDB settings read failed; keeping defaults in memory without overwriting disk:",
+        lastErr,
+      );
+      if (this.settingsFallback === null) {
+        this.settingsFallback = DEFAULT_FILTER_SETTINGS;
+      }
+      return this.settingsFallback;
+    })().finally(() => {
+      this.settingsLoadPromise = null;
+    });
+
+    this.settingsLoadPromise = loadPromise;
+    return loadPromise;
+  }
+
+  public async saveSettings(settings: FilterSettings): Promise<void> {
+    const mySeq = ++this.settingsMutationSeq;
+    this.settingsFallback = settings;
+    if (this.settingsPersistenceDegraded) {
+      this.degradedSettingsMutated = true;
+    }
+    if (this.idbFactory === null) {
+      this.settingsLoaded = true;
+      return;
+    }
+
+    if (!this.settingsLoaded) {
+      if (this.settingsLoadPromise !== null) {
+        await this.settingsLoadPromise;
+      } else if (!this.settingsPersistenceDegraded || this.nowFn() >= this.nextSettingsRetryAtMs) {
+        await this.getSettings();
+      }
+    }
+
+    if (this.settingsMutationSeq !== mySeq) {
+      return;
+    }
+
+    if (this.settingsPersistenceDegraded) {
+      this.degradedSettingsMutated = true;
+      return;
+    }
+
+    await this.enqueuePersistSettings(settings, mySeq);
   }
 
   public async resetPersistedFeedback(
@@ -934,15 +1361,41 @@ export class IndexedDbWeightStore {
     );
     const cleaned: OnlineClassifierWeights = {
       ...base,
-      weightsRevision: resetWeights?.weightsRevision ?? (this.memoryFallback?.weightsRevision ?? 1) + 1,
+      weightsRevision:
+        resetWeights?.weightsRevision ?? (this.memoryFallback?.weightsRevision ?? 1) + 1,
       updateCount: 0,
       rollbackCount: 0,
       replayBuffer: [],
       undoHistory: [],
       recordedAutoFlagIds: new Set<TweetId>(),
+      dimsReviewedCount: 0,
+      dimsOverriddenHumanCount: 0,
     };
-    await this.saveWeights(cleaned);
-    return cleaned;
+
+    const mySeq = ++this.weightsMutationSeq;
+    this.weightsResetEpoch += 1;
+    this.memoryFallback = cleaned;
+    this.degradedWeightsMutated = false;
+
+    if (this.idbFactory === null) {
+      this.weightsLoaded = true;
+      return cleaned;
+    }
+
+    // Wait for any in-flight cold load so stale reads/saves can never interleave after reset
+    if (this.weightsLoadPromise !== null) {
+      await this.weightsLoadPromise;
+    }
+    if (this.weightsMutationSeq !== mySeq) {
+      return this.memoryFallback!;
+    }
+
+    await this.enqueuePersistWeights(cleaned, mySeq, {
+      forceReplayWrite: true,
+      allowWhileDegraded: true,
+      clearDegradedOnSuccess: true,
+    });
+    return this.memoryFallback!;
   }
 }
 
@@ -986,6 +1439,7 @@ export class OffscreenFilterService {
   private onStage2Update: ((msg: Stage2VerdictUpdateMessage) => void | Promise<void>) | undefined;
   private currentSettings: FilterSettings = DEFAULT_FILTER_SETTINGS;
   private settingsLoaded = false;
+  private settingsInitPromise: Promise<FilterSettings> | null = null;
   private seedsEmbedded = false;
   private readonly opTextByThread = new Map<ThreadId, string>();
 
@@ -1012,6 +1466,10 @@ export class OffscreenFilterService {
     this.onStage2Update = cb;
   }
 
+  public getPersistenceHealth(): PersistenceHealth {
+    return this.weightStore.getPersistenceHealth();
+  }
+
   public async waitForStage2Idle(): Promise<void> {
     if (this.stage2Judge !== undefined) {
       await this.stage2Judge.waitForIdle();
@@ -1019,12 +1477,30 @@ export class OffscreenFilterService {
   }
 
   private async ensureSettingsLoaded(): Promise<FilterSettings> {
-    if (!this.settingsLoaded) {
-      this.currentSettings = await this.weightStore.getSettings();
-      this.engine.setSettings(this.currentSettings);
-      this.settingsLoaded = true;
+    if (this.settingsLoaded) {
+      return this.currentSettings;
     }
-    return this.currentSettings;
+    if (this.settingsInitPromise !== null) {
+      return this.settingsInitPromise;
+    }
+
+    this.settingsInitPromise = this.weightStore
+      .getSettings()
+      .then((loaded) => {
+        if (!this.settingsLoaded) {
+          this.currentSettings = loaded;
+          this.engine.setSettings(loaded);
+          if (!this.weightStore.getPersistenceHealth().settingsDegraded) {
+            this.settingsLoaded = true;
+          }
+        }
+        return this.currentSettings;
+      })
+      .finally(() => {
+        this.settingsInitPromise = null;
+      });
+
+    return this.settingsInitPromise;
   }
 
   private async getStage2Status(settings: FilterSettings): Promise<Stage2StatusTag> {
@@ -1182,25 +1658,36 @@ export class OffscreenFilterService {
       }
 
       if (req.kind === "update_settings") {
-        const nextRevision = Math.max(req.settings.revision, settings.revision + 1);
+        // Always read live this.currentSettings (never a stale local snapshot across awaits)
+        const cur = this.currentSettings;
+        if (areFilterSettingsEqual(req.settings, cur)) {
+          return {
+            kind: "settings_ok",
+            settings: cur,
+            reevaluatedThreads: 0,
+          };
+        }
+        const nextRevision = Math.max(req.settings.revision, cur.revision + 1);
         const nextSettings: FilterSettings = {
           preset: req.settings.preset,
           toggles: { ...req.settings.toggles },
           revision: nextRevision,
         };
         this.currentSettings = nextSettings;
+        this.settingsLoaded = true;
         this.engine.setSettings(nextSettings);
         await this.weightStore.saveSettings(nextSettings);
 
-        if (!nextSettings.toggles.enableStage2 && this.stage2Judge !== undefined) {
+        if (!this.currentSettings.toggles.enableStage2 && this.stage2Judge !== undefined) {
           this.stage2Judge.clearPending();
         }
 
         const weights = await this.weightStore.getWeights();
-        const reevaluated = this.engine.reevaluateAllThreads(weights, nextSettings);
+        const latestSettings = this.currentSettings;
+        const reevaluated = this.engine.reevaluateAllThreads(weights, latestSettings);
         return {
           kind: "settings_ok",
-          settings: nextSettings,
+          settings: latestSettings,
           reevaluatedThreads: reevaluated.size,
         };
       }
@@ -1328,6 +1815,7 @@ export class OffscreenFilterService {
         req.candidates,
         weights,
         settings,
+        req.focalAuthorId,
       );
 
       if (toEmbed.length === 0) {
@@ -1344,25 +1832,36 @@ export class OffscreenFilterService {
 
       await this.ensureLiveSeedPrototypes(weights);
       const embedded = await this.gpuHost.embedCandidates(toEmbed);
+      // Re-read both weights and currentSettings after GPU await so concurrent updates take effect
       weights = await this.weightStore.getWeights();
-      const fresh = this.engine.ingestEmbeddedBatch(req.threadId, embedded, weights, settings);
+      const activeSettings = this.currentSettings;
+      const fresh = this.engine.ingestEmbeddedBatch(
+        req.threadId,
+        embedded,
+        weights,
+        activeSettings,
+        undefined,
+        req.focalAuthorId,
+      );
 
-      // Auto-flag hygiene: ONLY record auto_flag for hard evidence (keyword_spam, bio_scam, thread_clone)
-      // including retroactive thread_clone promotions, deduplicated per tweetId.
-      let authorStatsChanged = false;
-      for (const v of [...fresh.verdicts, ...fresh.retroactiveUpdates]) {
-        if (isHardEvidenceAutoFlag(v)) {
-          const next = recordAuthorOutcome(weights, v.authorId!, "auto_flag", {
-            tweetId: v.tweetId,
-          });
-          if (next !== weights) {
-            weights = next;
-            authorStatsChanged = true;
+      // Auto-flag hygiene: ONLY record auto_flag when learnFromFeedback is enabled (spec §4d.5)
+      // and ONLY for hard evidence (keyword_spam, bio_scam, thread_clone + retroactive), deduplicated per tweetId.
+      if (activeSettings.toggles.learnFromFeedback) {
+        let authorStatsChanged = false;
+        for (const v of [...fresh.verdicts, ...fresh.retroactiveUpdates]) {
+          if (isHardEvidenceAutoFlag(v)) {
+            const next = recordAuthorOutcome(weights, v.authorId!, "auto_flag", {
+              tweetId: v.tweetId,
+            });
+            if (next !== weights) {
+              weights = next;
+              authorStatsChanged = true;
+            }
           }
         }
-      }
-      if (authorStatsChanged) {
-        await this.weightStore.saveWeights(weights);
+        if (authorStatsChanged) {
+          await this.weightStore.saveWeights(weights);
+        }
       }
 
       const response: OffscreenRpcResponse = {
@@ -1376,7 +1875,7 @@ export class OffscreenFilterService {
       };
 
       // Enqueue Stage-2 suspects asynchronously AFTER constructing Stage-1 response (non-blocking)
-      this.enqueueStage2Suspects(req.threadId, embedded, fresh.verdicts, settings);
+      this.enqueueStage2Suspects(req.threadId, embedded, fresh.verdicts, activeSettings);
 
       return response;
     } catch (err) {
