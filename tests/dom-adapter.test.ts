@@ -1,16 +1,22 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
 import { parseHTML } from "linkedom";
 import {
   XThreadDomAdapter,
   extractTweetTextWithTwemoji,
   formatDiagnosticsTooltip,
   formatFilterReasonBadge,
+  parseFocalAuthorIdFromPathname,
 } from "../src/content/dom-adapter.ts";
 import {
   GRAPHQL_CONTENT_SOURCE,
   GRAPHQL_TAP_PROTOCOL_VERSION,
   GRAPHQL_TAP_SOURCE,
+} from "../src/content/graphql-bridge.ts";
+import {
   extractGraphqlTweetMetasFromJson,
   installGraphqlTap,
 } from "../src/content/graphql-tap.ts";
@@ -113,9 +119,11 @@ describe("XThreadDomAdapter extraction, cutoff, and zero-jitter dimming", () => 
     const adapter = new XThreadDomAdapter();
     const requests: OffscreenRpcRequest[] = [];
 
+    let seenFocalAuthorId: string | undefined;
     const sendRpc = async (req: OffscreenRpcRequest): Promise<OffscreenRpcResponse> => {
       requests.push(req);
       if (req.kind === "evaluate_batch") {
+        seenFocalAuthorId = (req as { focalAuthorId?: string }).focalAuthorId;
         const verdicts: VerdictRecord[] = [
           {
             tweetId: "1001" as TweetId,
@@ -173,6 +181,7 @@ describe("XThreadDomAdapter extraction, cutoff, and zero-jitter dimming", () => 
     };
 
     await runScrollPass(doc, "/op_author/status/1000", adapter, sendRpc);
+    assert.equal(seenFocalAuthorId, "op_author");
 
     const botArticle = doc.querySelector('article[data-xrf-tweet-id="1001"]');
     const jpArticle = doc.querySelector('article[data-xrf-tweet-id="1002"]');
@@ -200,6 +209,7 @@ describe("XThreadDomAdapter extraction, cutoff, and zero-jitter dimming", () => 
     assert.equal(botArticle.getAttribute("data-xrf-user-revealed"), "true");
 
     await runScrollPass(doc, "/op_author/status/1000", adapter, sendRpc);
+    assert.equal(seenFocalAuthorId, "op_author");
     assert.equal(
       botArticle.getAttribute("data-xrf-state"),
       "revealed",
@@ -217,6 +227,7 @@ describe("XThreadDomAdapter extraction, cutoff, and zero-jitter dimming", () => 
 
     const rpcCountBeforeIdlePass = requests.length;
     await runScrollPass(doc, "/op_author/status/1000", adapter, sendRpc);
+    assert.equal(seenFocalAuthorId, "op_author");
     assert.equal(
       requests.length,
       rpcCountBeforeIdlePass,
@@ -695,15 +706,25 @@ describe("GraphQL passive recursive walker and MAIN/isolated window bridge", () 
       public responseType: XMLHttpRequestResponseType = "";
       public responseText = "";
       public response: unknown = null;
-      private readonly loadListeners: Array<() => void> = [];
+      public shouldThrowOnSend = false;
+      public readonly loadListeners: Array<() => void> = [];
       public open(_method: string, _url: string | URL): void {}
       public send(): void {
+        if (this.shouldThrowOnSend) {
+          throw new Error("InvalidStateError");
+        }
         for (const cb of this.loadListeners.splice(0)) {
           cb.call(this);
         }
       }
       public addEventListener(type: string, cb: () => void): void {
         if (type === "load") this.loadListeners.push(cb);
+      }
+      public removeEventListener(type: string, cb: () => void): void {
+        if (type === "load") {
+          const idx = this.loadListeners.indexOf(cb);
+          if (idx >= 0) this.loadListeners.splice(idx, 1);
+        }
       }
     }
 
@@ -985,6 +1006,295 @@ describe("GraphQL passive recursive walker and MAIN/isolated window bridge", () 
     }
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(updatedArticle.getAttribute("data-xrf-state"), "clean");
+
+    handle.dispose();
+  });
+
+  it("cleans stale below-cutoff and SPA-navigated articles, blocks forged screenName, updates dynamic badges, and uses inset box-shadow", () => {
+    const adapter = new XThreadDomAdapter();
+    const { document } = parseHTML(`
+      <!doctype html><html><head></head><body><main>
+        <div data-testid="cellInnerDiv"><article data-testid="tweet"><a href="/op_user/status/100"></a><div data-testid="tweetText">OP</div></article></div>
+        <div data-testid="cellInnerDiv"><article data-testid="tweet"><div class="col"><a href="/bot_a/status/101"></a><div data-testid="tweetText">Same reply</div></div></article></div>
+        <div data-testid="cellInnerDiv"><article data-testid="tweet"><div class="col"><a href="/bot_a/status/101"></a><div data-testid="tweetText">Same reply duplicate</div></div></article></div>
+        <div data-testid="cellInnerDiv"><h2><span>Discover more</span></h2></div>
+        <div data-testid="cellInnerDiv">
+          <article data-testid="tweet" data-xrf-tweet-id="999" data-xrf-state="dimmed" data-xrf-reason="keyword_spam">
+            <div class="col"><a href="/below/status/999"></a><div data-testid="tweetText">Below cutoff recycled</div><div class="xrf-control-bar">old</div></div>
+          </article>
+        </div>
+      </main></body></html>
+    `);
+    const doc = document as unknown as Document;
+
+    // Cross-check forged screenName vs DOM authorId
+    const forgedCache = new Map([
+      [
+        "101" as TweetId,
+        {
+          tweetId: "101" as TweetId,
+          screenName: "different_followed_account" as AuthorId,
+          displayName: null,
+          authorCreatedAtMs: null,
+          tweetCreatedAtMs: null,
+          inReplyToStatusId: null,
+          conversationId: null,
+          description: null,
+          isBlueVerified: null,
+          verifiedType: "none" as const,
+          following: true,
+          followedBy: null,
+          followersCount: null,
+          friendsCount: null,
+          statusesCount: null,
+          defaultProfileImage: null,
+          favoriteCount: null,
+          replyCount: null,
+          retweetCount: null,
+          mediaTypes: [],
+        },
+      ],
+    ]);
+
+    const snap = adapter.extractThreadSnapshot(doc, "/op_user/status/100", forgedCache);
+    assert(snap !== null);
+    assert.equal(snap.focalAuthorId, "op_user");
+    assert.equal(parseFocalAuthorIdFromPathname("/i/status/100"), null);
+    assert.equal(parseFocalAuthorIdFromPathname("/home"), null);
+    assert.equal(snap.candidates[1]!.graphqlMeta, undefined, "mismatched screenName must drop forged graphqlMeta");
+
+    // Below-cutoff stale state & bar must be swept clean
+    const belowArticle = doc.querySelector('a[href="/below/status/999"]')?.closest("article")!;
+    assert.equal(belowArticle.getAttribute("data-xrf-state"), null);
+    assert.equal(belowArticle.getAttribute("data-xrf-tweet-id"), null);
+    assert.equal(belowArticle.querySelector(".xrf-control-bar"), null);
+
+    // Malformed tweetId ignored safely; duplicate 101 renders both updated; dynamic badge text updates in place
+    adapter.applyVerdictsInPlace(
+      doc,
+      [
+        {
+          tweetId: 'bad"]' as TweetId,
+          action: "dim",
+          score: 1,
+          tokenCount: asTokenCount(4),
+          reason: { kind: "clean", action: "keep" },
+        },
+        {
+          tweetId: "101" as TweetId,
+          authorId: "bot_a" as AuthorId,
+          action: "dim",
+          score: 0.94,
+          tokenCount: asTokenCount(4),
+          reason: {
+            kind: "thread_clone",
+            action: "dim",
+            similarityToPeer: asUnitCosine(0.94),
+            canonicalTweetId: "100" as TweetId,
+            clusterSize: 2,
+          },
+        },
+      ],
+      () => {},
+    );
+    const dupArticles = Array.from(doc.querySelectorAll('article[data-xrf-tweet-id="101"]'));
+    assert.equal(dupArticles.length, 2);
+    for (const a of dupArticles) {
+      assert.equal(a.querySelector(".xrf-badge")?.textContent, "@bot_a · Bot clone (2x)");
+    }
+
+    // Updated clusterSize (2x -> 3x) with same action & reason kind must refresh badge text
+    adapter.applyVerdictsInPlace(
+      doc,
+      [
+        {
+          tweetId: "101" as TweetId,
+          authorId: "bot_a" as AuthorId,
+          action: "dim",
+          score: 0.96,
+          tokenCount: asTokenCount(4),
+          reason: {
+            kind: "thread_clone",
+            action: "dim",
+            similarityToPeer: asUnitCosine(0.96),
+            canonicalTweetId: "100" as TweetId,
+            clusterSize: 3,
+          },
+        },
+      ],
+      () => {},
+    );
+    assert.equal(dupArticles[0]!.querySelector(".xrf-badge")?.textContent, "@bot_a · Bot clone (3x)");
+
+    const styleText = doc.getElementById("xrf-injected-styles")?.textContent ?? "";
+    assert.equal(styleText.includes("box-shadow: inset 2px 0 0 rgba(245, 158, 11, 0.55)"), true);
+    assert.equal(styleText.includes("border-left:"), false);
+
+    // SPA navigation away from thread (/home -> threadId === null) clears remaining stale articles
+    assert.equal(adapter.extractThreadSnapshot(doc, "/home"), null);
+    assert.equal(dupArticles[0]!.getAttribute("data-xrf-state"), null);
+    assert.equal(dupArticles[0]!.querySelector(".xrf-control-bar"), null);
+  });
+
+  it("enforces tap safety (no legacy.verified blue coercion, null origin skip, XHR cleanup on throw) and keeps content.js bundle free of installGraphqlTap & calibrated data", async () => {
+    // 1. legacy.verified: false without is_blue_verified must leave isBlueVerified === null
+    const legacyOnly = extractGraphqlTweetMetasFromJson({
+      data: {
+        tweet: {
+          __typename: "Tweet",
+          rest_id: "7701",
+          core: {
+            user_results: {
+              result: {
+                __typename: "User",
+                rest_id: "55",
+                legacy: { screen_name: "legacy_user", verified: false },
+              },
+            },
+          },
+          legacy: { id_str: "7701" },
+        },
+      },
+    });
+    assert.equal(legacyOnly.length, 1);
+    assert.equal(legacyOnly[0]!.isBlueVerified, null);
+
+    // 2. Null origin skips postMessage (never falls back to "*") and XHR send throw removes load listener
+    const posted: unknown[] = [];
+    let removedCount = 0;
+    class ThrowXhr {
+      public status = 200;
+      public responseType: XMLHttpRequestResponseType = "text";
+      public responseText = "{}";
+      public response: unknown = null;
+      public listeners: Array<() => void> = [];
+      public open(): void {}
+      public send(): void {
+        throw new Error("InvalidStateError");
+      }
+      public addEventListener(_t: string, cb: () => void): void {
+        this.listeners.push(cb);
+      }
+      public removeEventListener(_t: string, cb: () => void): void {
+        const i = this.listeners.indexOf(cb);
+        if (i >= 0) {
+          this.listeners.splice(i, 1);
+          removedCount += 1;
+        }
+      }
+    }
+    const nullOriginWin = {
+      location: { origin: "null" },
+      XMLHttpRequest: ThrowXhr,
+      postMessage(d: unknown) {
+        posted.push(d);
+      },
+      addEventListener() {},
+    } as unknown as Window;
+    installGraphqlTap(nullOriginWin);
+    const xhr = new ThrowXhr();
+    xhr.open();
+    assert.throws(() => xhr.send(), /InvalidStateError/);
+    // Even if URL matched, nothing lingers on ThrowXhr; test matching URL too:
+    const xhrProto = (nullOriginWin as unknown as { XMLHttpRequest: { prototype: ThrowXhr } }).XMLHttpRequest.prototype;
+    (xhrProto.open as (m: string, u: string) => void).call(xhr, "GET", "https://x.com/i/api/graphql/123/TweetDetail");
+    assert.throws(() => xhr.send(), /InvalidStateError/);
+    assert.equal(removedCount, 1);
+    assert.equal(xhr.listeners.length, 0);
+    assert.equal(posted.length, 0);
+
+    // 3. Bundle isolation check: content.js must NOT include installGraphqlTap, XMLHttpRequest, or CALIBRATED_WEIGHTS_V2
+    const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const contentBundle = await build({
+      entryPoints: [path.join(rootDir, "src/content/index.ts")],
+      bundle: true,
+      write: false,
+      format: "iife",
+      target: "es2022",
+      platform: "browser",
+    });
+    const contentJs = contentBundle.outputFiles[0]!.text;
+    assert.equal(contentJs.includes("installGraphqlTap"), false);
+    assert.equal(contentJs.includes("XMLHttpRequest"), false);
+    assert.equal(contentJs.includes("CALIBRATED_WEIGHTS_V2"), false);
+    assert.equal(contentJs.includes("ANCHOR_SET_V2"), false);
+
+    const tapBundle = await build({
+      entryPoints: [path.join(rootDir, "src/content/graphql-tap.ts")],
+      bundle: true,
+      write: false,
+      format: "iife",
+      target: "es2022",
+      platform: "browser",
+    });
+    const tapJs = tapBundle.outputFiles[0]!.text;
+    assert.equal(tapJs.includes("installGraphqlTap"), true);
+    assert.equal(tapJs.includes("chrome.runtime"), false);
+  });
+
+  it("ignores XRF-only childList bar insertion mutations in mountThreadObserver", async () => {
+    const doc = buildMockXThreadDocument();
+    let observerCb: ((records: MutationRecord[]) => void) | null = null;
+    class MockObserver {
+      constructor(cb: (records: MutationRecord[]) => void) {
+        observerCb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    const mockWin = {
+      location: { origin: "https://x.com" },
+      MutationObserver: MockObserver,
+      postMessage() {},
+      addEventListener() {},
+      removeEventListener() {},
+    } as unknown as Window;
+
+    let rpcCount = 0;
+    const sendRpc = async (req: OffscreenRpcRequest): Promise<OffscreenRpcResponse> => {
+      rpcCount += 1;
+      if (req.kind === "evaluate_batch") {
+        return {
+          kind: "evaluate_batch_ok",
+          result: {
+            threadId: req.threadId,
+            anchorKind: "text_anchored",
+            verdicts: [
+              {
+                tweetId: "1001" as TweetId,
+                authorId: "bot_account" as AuthorId,
+                action: "dim",
+                score: 0.9,
+                tokenCount: asTokenCount(14),
+                reason: { kind: "keyword_spam", action: "dim", matchedPattern: "test" },
+              },
+            ],
+            retroactiveUpdates: [],
+          },
+        };
+      }
+      return { kind: "health_ok", gpuStatus: "ready", deviceEpoch: 1 };
+    };
+
+    const handle = mountThreadObserver(doc, sendRpc, () => "/op_author/status/1000", 10, {
+      win: mockWin,
+    });
+    await handle.flushNow();
+    assert.equal(rpcCount, 1);
+
+    const bar = doc.querySelector(".xrf-control-bar")!;
+    const col = bar.parentElement!;
+    assert(observerCb !== null);
+    (observerCb as (records: MutationRecord[]) => void)([
+      {
+        type: "childList",
+        target: col,
+        addedNodes: [bar] as unknown as NodeList,
+        removedNodes: [] as unknown as NodeList,
+      } as unknown as MutationRecord,
+    ]);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(rpcCount, 1, "XRF-only childList bar insertion must not trigger extra RPC pass");
 
     handle.dispose();
   });

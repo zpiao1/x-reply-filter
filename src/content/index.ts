@@ -16,7 +16,7 @@ import {
   GRAPHQL_CONTENT_SOURCE,
   GRAPHQL_TAP_PROTOCOL_VERSION,
   GRAPHQL_TAP_SOURCE,
-} from "./graphql-tap.ts";
+} from "./graphql-bridge.ts";
 
 export const MAX_GQL_CACHE = 1000 as const;
 const MAX_EVALUATED_TRACKED = 2000 as const;
@@ -61,6 +61,20 @@ function isXrfInternalNode(node: Node | null): boolean {
       }
     }
     curr = curr.parentNode;
+  }
+  return false;
+}
+
+function isXrfOnlyMutation(mutation: MutationRecord): boolean {
+  if (isXrfInternalNode(mutation.target)) {
+    return true;
+  }
+  if (mutation.type === "childList") {
+    const added = Array.from(mutation.addedNodes);
+    const removed = Array.from(mutation.removedNodes);
+    if (added.length + removed.length > 0) {
+      return added.every(isXrfInternalNode) && removed.every(isXrfInternalNode);
+    }
   }
   return false;
 }
@@ -225,6 +239,7 @@ export async function runScrollPass(
       kind: "evaluate_batch",
       threadId: snapshot.threadId,
       candidates: snapshot.candidates,
+      ...(snapshot.focalAuthorId != null ? { focalAuthorId: snapshot.focalAuthorId } : {}),
       target: "background",
     });
   } catch {
@@ -328,6 +343,10 @@ export function mountThreadObserver(
   };
 
   const onWindowMessage = (event: MessageEvent): void => {
+    if (!isExtensionContextValid()) {
+      win?.removeEventListener("message", onWindowMessage);
+      return;
+    }
     if (win === undefined || event.source !== win || !ALLOWED_X_ORIGINS.has(event.origin)) {
       return;
     }
@@ -384,7 +403,7 @@ export function mountThreadObserver(
             observer.disconnect();
             return;
           }
-          const hasExternalMutation = mutations.some((m) => !isXrfInternalNode(m.target));
+          const hasExternalMutation = mutations.some((m) => !isXrfOnlyMutation(m));
           if (hasExternalMutation) {
             schedulePass(false);
           }

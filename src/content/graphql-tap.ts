@@ -5,12 +5,22 @@ import type {
   TweetId,
   VerifiedType,
 } from "../domain/types.ts";
+import {
+  GRAPHQL_CONTENT_SOURCE,
+  GRAPHQL_TAP_PROTOCOL_VERSION,
+  GRAPHQL_TAP_SOURCE,
+  MAX_TAP_BUFFER,
+  TARGET_GRAPHQL_URL_RE,
+  type TapBatchMessage,
+} from "./graphql-bridge.ts";
 
-export const GRAPHQL_TAP_SOURCE = "xrf-graphql-tap" as const;
-export const GRAPHQL_CONTENT_SOURCE = "xrf-content" as const;
-export const GRAPHQL_TAP_PROTOCOL_VERSION = 1 as const;
-export const MAX_TAP_BUFFER = 256 as const;
-export const TARGET_GRAPHQL_URL_RE = /\/graphql\/[^/]+\/(TweetDetail|TweetResultByRestId)\b/;
+export {
+  GRAPHQL_CONTENT_SOURCE,
+  GRAPHQL_TAP_PROTOCOL_VERSION,
+  GRAPHQL_TAP_SOURCE,
+  MAX_TAP_BUFFER,
+  TARGET_GRAPHQL_URL_RE,
+};
 
 const INSTALLED_SYMBOL = Symbol.for("xrf.graphqlTapInstalled");
 const MAX_WALK_DEPTH = 32;
@@ -18,12 +28,6 @@ const MAX_DESCRIPTION_LEN = 512;
 const MAX_DISPLAY_NAME_LEN = 128;
 const TWEET_ID_RE = /^\d{1,32}$/;
 const AUTHOR_HANDLE_RE = /^[a-z0-9_]{1,64}$/;
-
-interface TapBatchMessage {
-  readonly source: typeof GRAPHQL_TAP_SOURCE;
-  readonly v: typeof GRAPHQL_TAP_PROTOCOL_VERSION;
-  readonly items: ReadonlyArray<GraphqlTweetMeta>;
-}
 
 function isRecord(val: unknown): val is Record<string, unknown> {
   return typeof val === "object" && val !== null && !Array.isArray(val);
@@ -180,8 +184,7 @@ function extractSingleTweetMeta(tweet: Record<string, unknown>): GraphqlTweetMet
     userNode === null
       ? null
       : readNullableBool(userNode.is_blue_verified) ??
-        readNullableBool(userVerification?.is_blue_verified) ??
-        readNullableBool(userLegacy?.verified);
+        readNullableBool(userVerification?.is_blue_verified);
 
   const rawVerifiedType = (
     readString(userVerification?.verified_type) ??
@@ -344,16 +347,16 @@ function resolveFetchUrl(input: RequestInfo | URL): string | null {
   return null;
 }
 
-function resolveTargetOrigin(win: Window): string {
+function resolveTargetOrigin(win: Window): string | null {
   try {
     const origin = win.location?.origin;
     if (typeof origin === "string" && origin !== "" && origin !== "null") {
       return origin;
     }
   } catch {
-    // Fallback below
+    // Unavailable origin
   }
-  return "*";
+  return null;
 }
 
 export function installGraphqlTap(targetWindow: Window): void {
@@ -377,13 +380,17 @@ export function installGraphqlTap(targetWindow: Window): void {
     if (items.length === 0) {
       return;
     }
+    const targetOrigin = resolveTargetOrigin(targetWindow);
+    if (targetOrigin === null) {
+      return;
+    }
     const msg: TapBatchMessage = {
       source: GRAPHQL_TAP_SOURCE,
       v: GRAPHQL_TAP_PROTOCOL_VERSION,
       items,
     };
     try {
-      targetWindow.postMessage(msg, resolveTargetOrigin(targetWindow));
+      targetWindow.postMessage(msg, targetOrigin);
     } catch {
       // Ignore postMessage failure
     }
@@ -515,37 +522,51 @@ export function installGraphqlTap(targetWindow: Window): void {
     xhrProto.send = function (
       this: XMLHttpRequest,
     ): void {
+      let loadListener: ((this: XMLHttpRequest) => void) | null = null;
       try {
         const url = xhrUrls.get(this);
         if (url !== undefined && TARGET_GRAPHQL_URL_RE.test(url)) {
-          this.addEventListener(
-            "load",
-            function onXrfXhrLoad() {
-              try {
-                if (this.status < 200 || this.status >= 300) {
-                  return;
-                }
-                if (this.responseType === "json") {
-                  if (this.response !== null && typeof this.response === "object") {
-                    emitFromJson(this.response);
-                  }
-                } else if (this.responseType === "" || this.responseType === "text") {
-                  const text = this.responseText;
-                  if (typeof text === "string" && text.length > 0) {
-                    emitFromJson(JSON.parse(text));
-                  }
-                }
-              } catch {
-                // Passive tap must never throw
+          loadListener = function onXrfXhrLoad(this: XMLHttpRequest) {
+            try {
+              const activeUrl = xhrUrls.get(this);
+              if (activeUrl === undefined || !TARGET_GRAPHQL_URL_RE.test(activeUrl)) {
+                return;
               }
-            },
-            { once: true },
-          );
+              if (this.status < 200 || this.status >= 300) {
+                return;
+              }
+              if (this.responseType === "json") {
+                if (this.response !== null && typeof this.response === "object") {
+                  emitFromJson(this.response);
+                }
+              } else if (this.responseType === "" || this.responseType === "text") {
+                const text = this.responseText;
+                if (typeof text === "string" && text.length > 0) {
+                  emitFromJson(JSON.parse(text));
+                }
+              }
+            } catch {
+              // Passive tap must never throw
+            }
+          };
+          this.addEventListener("load", loadListener, { once: true });
         }
       } catch {
-        // Ignore XHR hook setup error
+        loadListener = null;
       }
-      origSend.apply(this, arguments as unknown as Parameters<typeof origSend>);
+
+      try {
+        origSend.apply(this, arguments as unknown as Parameters<typeof origSend>);
+      } catch (err) {
+        if (loadListener !== null && typeof this.removeEventListener === "function") {
+          try {
+            this.removeEventListener("load", loadListener);
+          } catch {
+            // Ignore cleanup failure
+          }
+        }
+        throw err;
+      }
     };
   }
 }

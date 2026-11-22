@@ -48,7 +48,7 @@ article[data-xrf-state="revealed"] [data-testid="card.wrapper"] {
   filter: none !important;
 }
 article[data-xrf-state="suspect"] {
-  border-left: 2px solid rgba(245, 158, 11, 0.55) !important;
+  box-shadow: inset 2px 0 0 rgba(245, 158, 11, 0.55) !important;
 }
 article[data-xrf-state="suspect"] [data-testid="tweetText"],
 article[data-xrf-state="suspect"] [data-testid="tweetPhoto"],
@@ -360,8 +360,21 @@ export function formatDiagnosticsTooltip(verdict: VerdictRecord): string {
   ].join(" | ");
 }
 
+export function parseFocalAuthorIdFromPathname(pathname: string): AuthorId | null {
+  const match = /^\/?([^/]+)\/status\/\d{1,32}(?:\/|$|\?)/i.exec(pathname.trim());
+  if (!match || !match[1]) {
+    return null;
+  }
+  const candidate = match[1].trim().replace(/^@+/, "").toLowerCase();
+  if (candidate === "i" || candidate === "intent") {
+    return null;
+  }
+  return parseAuthorId(candidate);
+}
+
 export interface ThreadDomSnapshot {
   readonly threadId: ThreadId;
+  readonly focalAuthorId?: AuthorId | null | undefined;
   readonly candidates: ReadonlyArray<CandidateTweet>;
   readonly hasUnscoredReplies: boolean;
 }
@@ -374,16 +387,47 @@ export class XThreadDomAdapter {
   ): ThreadDomSnapshot | null {
     const threadId = parseThreadId(locationPathname);
     if (threadId === null) {
+      for (const article of Array.from(
+        root.querySelectorAll('article[data-xrf-state], article[data-xrf-tweet-id]'),
+      )) {
+        const identity = extractStatusIdentity(article);
+        const prevId = article.getAttribute("data-xrf-tweet-id");
+        if (
+          article.hasAttribute("data-xrf-state") ||
+          (prevId !== null && (identity === null || prevId !== identity.tweetId))
+        ) {
+          article.removeAttribute("data-xrf-tweet-id");
+          clearRecycledArticleAttributes(article);
+        }
+      }
       return null;
     }
 
+    const focalAuthorId = parseFocalAuthorIdFromPathname(locationPathname);
     const cells = Array.from(root.querySelectorAll('[data-testid="cellInnerDiv"]'));
     const articles: Element[] = [];
 
     if (cells.length > 0) {
+      let hitCutoff = false;
       for (const cell of cells) {
-        if (isDiscoverMoreDivider(cell)) {
-          break;
+        if (!hitCutoff && isDiscoverMoreDivider(cell)) {
+          hitCutoff = true;
+          continue;
+        }
+        if (hitCutoff) {
+          for (const belowArticle of Array.from(
+            cell.querySelectorAll('article[data-testid="tweet"]'),
+          )) {
+            if (
+              belowArticle.hasAttribute("data-xrf-state") ||
+              belowArticle.hasAttribute("data-xrf-tweet-id") ||
+              belowArticle.querySelector(".xrf-control-bar") !== null
+            ) {
+              belowArticle.removeAttribute("data-xrf-tweet-id");
+              clearRecycledArticleAttributes(belowArticle);
+            }
+          }
+          continue;
         }
         const article = cell.querySelector('article[data-testid="tweet"]');
         if (article !== null) {
@@ -434,7 +478,13 @@ export class XThreadDomAdapter {
 
       const textNode = extractPrimaryTweetTextNode(article);
       const rawText = extractTweetTextWithTwemoji(textNode).trim();
-      const graphqlMeta = graphqlCache?.get(identity.tweetId) ?? null;
+      const rawMeta = graphqlCache?.get(identity.tweetId) ?? null;
+      const graphqlMeta =
+        rawMeta !== null &&
+        ((rawMeta.screenName != null && rawMeta.screenName !== identity.authorId) ||
+          (rawMeta.tweetId != null && rawMeta.tweetId !== identity.tweetId))
+          ? null
+          : rawMeta;
 
       const hasVerifiedBadge = Array.from(
         article.querySelectorAll('[data-testid="icon-verified"]'),
@@ -499,7 +549,7 @@ export class XThreadDomAdapter {
       };
     });
 
-    return { threadId, candidates, hasUnscoredReplies };
+    return { threadId, focalAuthorId, candidates, hasUnscoredReplies };
   }
 
   public applyVerdictsInPlace(
@@ -513,177 +563,197 @@ export class XThreadDomAdapter {
     }
 
     for (const verdict of verdicts) {
-      const article = root.querySelector(
-        `article[data-xrf-tweet-id="${verdict.tweetId}"]`,
+      const safeTweetId = parseTweetId(verdict.tweetId);
+      if (safeTweetId === null || ownerDoc === null) {
+        continue;
+      }
+      const matchedArticles = Array.from(
+        root.querySelectorAll(`article[data-xrf-tweet-id="${safeTweetId}"]`),
       );
-      if (article === null || ownerDoc === null) {
+      if (matchedArticles.length === 0) {
         continue;
       }
 
-      const targetState =
-        verdict.action === "dim"
-          ? article.getAttribute("data-xrf-user-revealed") === "true"
-            ? "revealed"
-            : "dimmed"
-          : verdict.action === "suspect"
-            ? "suspect"
-            : "clean";
+      for (const article of matchedArticles) {
+        const targetState =
+          verdict.action === "dim"
+            ? article.getAttribute("data-xrf-user-revealed") === "true"
+              ? "revealed"
+              : "dimmed"
+            : verdict.action === "suspect"
+              ? "suspect"
+              : "clean";
 
-      if (verdict.action !== "dim" && article.hasAttribute("data-xrf-user-revealed")) {
-        article.removeAttribute("data-xrf-user-revealed");
-      }
-
-      const currentState = article.getAttribute("data-xrf-state");
-      const currentReason = article.getAttribute("data-xrf-reason");
-      const existingBar = article.querySelector(".xrf-control-bar");
-      const stage2Tag = verdict.explanation?.stage2
-        ? `${verdict.explanation.stage2.verdict}:${verdict.explanation.stage2.confidence.toFixed(2)}`
-        : "";
-      const expTag = verdict.explanation
-        ? `${verdict.explanation.preset}:${verdict.explanation.metaSource}:${verdict.explanation.ruleId}:${verdict.explanation.top.map((s) => s.id).join(",")}`
-        : "";
-
-      if (
-        currentState === targetState &&
-        currentReason === verdict.reason.kind &&
-        existingBar !== null &&
-        existingBar.getAttribute("data-xrf-bar-action") === verdict.action &&
-        (existingBar.getAttribute("data-xrf-stage2") ?? "") === stage2Tag &&
-        (existingBar.getAttribute("data-xrf-exp") ?? "") === expTag
-      ) {
-        continue;
-      }
-
-      article.setAttribute("data-xrf-state", targetState);
-      article.setAttribute("data-xrf-reason", verdict.reason.kind);
-      article.setAttribute("data-xrf-score", verdict.score.toFixed(3));
-      article.setAttribute("data-xrf-tokens", String(verdict.tokenCount));
-      if (verdict.explanation) {
-        article.setAttribute("data-xrf-meta-source", verdict.explanation.metaSource);
-      }
-      if (verdict.diagnostics) {
-        article.setAttribute(
-          "data-xrf-siamese",
-          verdict.diagnostics.siameseProbability.toFixed(3),
-        );
-        article.setAttribute("data-xrf-op-sim", verdict.diagnostics.opCosSim.toFixed(3));
-        article.setAttribute(
-          "data-xrf-clone-sim",
-          verdict.diagnostics.maxCloneSim.toFixed(3),
-        );
-        article.setAttribute(
-          "data-xrf-author-prior",
-          verdict.diagnostics.authorSpamPrior.toFixed(3),
-        );
-      }
-
-      const mountTarget = findControlMountContainer(article);
-      let bar = existingBar;
-      if (bar === null) {
-        bar = ownerDoc.createElement("div");
-        bar.className = "xrf-control-bar";
-        mountTarget.appendChild(bar);
-      } else if (bar.parentElement !== mountTarget) {
-        mountTarget.appendChild(bar);
-      }
-
-      bar.setAttribute("data-xrf-bar-action", verdict.action);
-      if (stage2Tag !== "") {
-        bar.setAttribute("data-xrf-stage2", stage2Tag);
-      } else {
-        bar.removeAttribute("data-xrf-stage2");
-      }
-      if (expTag !== "") {
-        bar.setAttribute("data-xrf-exp", expTag);
-      } else {
-        bar.removeAttribute("data-xrf-exp");
-      }
-      bar.setAttribute("title", formatDiagnosticsTooltip(verdict));
-      bar.textContent = "";
-
-      if (verdict.action === "dim") {
-        const badge = ownerDoc.createElement("span");
-        badge.className = "xrf-badge";
-        const resolvedAuthor = verdict.authorId ?? extractStatusIdentity(article)?.authorId;
-        const baseBadge = formatFilterReasonBadge(verdict.reason);
-        badge.textContent =
-          resolvedAuthor &&
-          verdict.reason.kind !== "known_bot_author" &&
-          verdict.reason.kind !== "bot_answer"
-            ? `@${resolvedAuthor} · ${baseBadge}`
-            : baseBadge;
-        bar.appendChild(badge);
-
-        const toggleBtn = ownerDoc.createElement("button");
-        toggleBtn.type = "button";
-        toggleBtn.className = "xrf-btn xrf-toggle-btn";
-        toggleBtn.textContent = targetState === "dimmed" ? "Show" : "Hide";
-        toggleBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          ev.preventDefault?.();
-          const nowRevealed = article.getAttribute("data-xrf-state") === "dimmed";
-          article.setAttribute("data-xrf-user-revealed", nowRevealed ? "true" : "false");
-          article.setAttribute("data-xrf-state", nowRevealed ? "revealed" : "dimmed");
-          toggleBtn.textContent = nowRevealed ? "Hide" : "Show";
-        });
-        bar.appendChild(toggleBtn);
-
-        const humanBtn = ownerDoc.createElement("button");
-        humanBtn.type = "button";
-        humanBtn.className = "xrf-btn xrf-feedback-human";
-        humanBtn.textContent = "Not spam";
-        humanBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          ev.preventDefault?.();
+        if (verdict.action !== "dim" && article.hasAttribute("data-xrf-user-revealed")) {
           article.removeAttribute("data-xrf-user-revealed");
-          onFeedback(verdict.tweetId, "human");
-        });
-        bar.appendChild(humanBtn);
-      } else if (verdict.action === "suspect") {
-        const badge = ownerDoc.createElement("span");
-        badge.className = "xrf-badge";
-        const baseBadge = formatFilterReasonBadge(verdict.reason);
-        badge.textContent =
-          verdict.reason.kind === "model_suspect"
-            ? baseBadge
-            : `Suspect · ${baseBadge}`;
-        bar.appendChild(badge);
+        }
 
-        const spamBtn = ownerDoc.createElement("button");
-        spamBtn.type = "button";
-        spamBtn.className = "xrf-btn xrf-feedback-spam";
-        spamBtn.textContent = "Mark bot";
-        spamBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          ev.preventDefault?.();
-          article.removeAttribute("data-xrf-user-revealed");
-          onFeedback(verdict.tweetId, "spam");
-        });
-        bar.appendChild(spamBtn);
+        const currentState = article.getAttribute("data-xrf-state");
+        const currentReason = article.getAttribute("data-xrf-reason");
+        const existingBar = article.querySelector(".xrf-control-bar");
+        const stage2Tag = verdict.explanation?.stage2
+          ? `${verdict.explanation.stage2.verdict}:${verdict.explanation.stage2.confidence.toFixed(2)}`
+          : "";
+        const expTag = verdict.explanation
+          ? `${verdict.explanation.preset}:${verdict.explanation.metaSource}:${verdict.explanation.ruleId}:${verdict.explanation.top.map((s) => s.id).join(",")}`
+          : "";
 
-        const humanBtn = ownerDoc.createElement("button");
-        humanBtn.type = "button";
-        humanBtn.className = "xrf-btn xrf-feedback-human";
-        humanBtn.textContent = "Not spam";
-        humanBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          ev.preventDefault?.();
-          article.removeAttribute("data-xrf-user-revealed");
-          onFeedback(verdict.tweetId, "human");
-        });
-        bar.appendChild(humanBtn);
-      } else {
-        const spamBtn = ownerDoc.createElement("button");
-        spamBtn.type = "button";
-        spamBtn.className = "xrf-btn xrf-feedback-spam";
-        spamBtn.textContent = "Mark bot";
-        spamBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          ev.preventDefault?.();
-          article.removeAttribute("data-xrf-user-revealed");
-          onFeedback(verdict.tweetId, "spam");
-        });
-        bar.appendChild(spamBtn);
+        const targetTitle = formatDiagnosticsTooltip(verdict);
+        const targetBadgeText =
+          verdict.action === "dim"
+            ? (() => {
+                const resolvedAuthor =
+                  verdict.authorId ?? extractStatusIdentity(article)?.authorId;
+                const baseBadge = formatFilterReasonBadge(verdict.reason);
+                return resolvedAuthor &&
+                  verdict.reason.kind !== "known_bot_author" &&
+                  verdict.reason.kind !== "bot_answer"
+                  ? `@${resolvedAuthor} · ${baseBadge}`
+                  : baseBadge;
+              })()
+            : verdict.action === "suspect"
+              ? (() => {
+                  const baseBadge = formatFilterReasonBadge(verdict.reason);
+                  return verdict.reason.kind === "model_suspect"
+                    ? baseBadge
+                    : `Suspect · ${baseBadge}`;
+                })()
+              : "";
+
+        const currentBadgeText = existingBar?.querySelector(".xrf-badge")?.textContent ?? "";
+        if (
+          currentState === targetState &&
+          currentReason === verdict.reason.kind &&
+          existingBar !== null &&
+          existingBar.getAttribute("data-xrf-bar-action") === verdict.action &&
+          currentBadgeText === targetBadgeText &&
+          (existingBar.getAttribute("title") ?? "") === targetTitle &&
+          (existingBar.getAttribute("data-xrf-stage2") ?? "") === stage2Tag &&
+          (existingBar.getAttribute("data-xrf-exp") ?? "") === expTag
+        ) {
+          continue;
+        }
+
+        article.setAttribute("data-xrf-state", targetState);
+        article.setAttribute("data-xrf-reason", verdict.reason.kind);
+        article.setAttribute("data-xrf-score", verdict.score.toFixed(3));
+        article.setAttribute("data-xrf-tokens", String(verdict.tokenCount));
+        if (verdict.explanation) {
+          article.setAttribute("data-xrf-meta-source", verdict.explanation.metaSource);
+        }
+        if (verdict.diagnostics) {
+          article.setAttribute(
+            "data-xrf-siamese",
+            verdict.diagnostics.siameseProbability.toFixed(3),
+          );
+          article.setAttribute("data-xrf-op-sim", verdict.diagnostics.opCosSim.toFixed(3));
+          article.setAttribute(
+            "data-xrf-clone-sim",
+            verdict.diagnostics.maxCloneSim.toFixed(3),
+          );
+          article.setAttribute(
+            "data-xrf-author-prior",
+            verdict.diagnostics.authorSpamPrior.toFixed(3),
+          );
+        }
+
+        const mountTarget = findControlMountContainer(article);
+        let bar = existingBar;
+        if (bar === null) {
+          bar = ownerDoc.createElement("div");
+          bar.className = "xrf-control-bar";
+          mountTarget.appendChild(bar);
+        } else if (bar.parentElement !== mountTarget) {
+          mountTarget.appendChild(bar);
+        }
+
+        bar.setAttribute("data-xrf-bar-action", verdict.action);
+        if (stage2Tag !== "") {
+          bar.setAttribute("data-xrf-stage2", stage2Tag);
+        } else {
+          bar.removeAttribute("data-xrf-stage2");
+        }
+        if (expTag !== "") {
+          bar.setAttribute("data-xrf-exp", expTag);
+        } else {
+          bar.removeAttribute("data-xrf-exp");
+        }
+        bar.setAttribute("title", targetTitle);
+        bar.textContent = "";
+
+        if (verdict.action === "dim") {
+          const badge = ownerDoc.createElement("span");
+          badge.className = "xrf-badge";
+          badge.textContent = targetBadgeText;
+          bar.appendChild(badge);
+
+          const toggleBtn = ownerDoc.createElement("button");
+          toggleBtn.type = "button";
+          toggleBtn.className = "xrf-btn xrf-toggle-btn";
+          toggleBtn.textContent = targetState === "dimmed" ? "Show" : "Hide";
+          toggleBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            ev.preventDefault?.();
+            const nowRevealed = article.getAttribute("data-xrf-state") === "dimmed";
+            article.setAttribute("data-xrf-user-revealed", nowRevealed ? "true" : "false");
+            article.setAttribute("data-xrf-state", nowRevealed ? "revealed" : "dimmed");
+            toggleBtn.textContent = nowRevealed ? "Hide" : "Show";
+          });
+          bar.appendChild(toggleBtn);
+
+          const humanBtn = ownerDoc.createElement("button");
+          humanBtn.type = "button";
+          humanBtn.className = "xrf-btn xrf-feedback-human";
+          humanBtn.textContent = "Not spam";
+          humanBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            ev.preventDefault?.();
+            article.removeAttribute("data-xrf-user-revealed");
+            onFeedback(safeTweetId, "human");
+          });
+          bar.appendChild(humanBtn);
+        } else if (verdict.action === "suspect") {
+          const badge = ownerDoc.createElement("span");
+          badge.className = "xrf-badge";
+          badge.textContent = targetBadgeText;
+          bar.appendChild(badge);
+
+          const spamBtn = ownerDoc.createElement("button");
+          spamBtn.type = "button";
+          spamBtn.className = "xrf-btn xrf-feedback-spam";
+          spamBtn.textContent = "Mark bot";
+          spamBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            ev.preventDefault?.();
+            article.removeAttribute("data-xrf-user-revealed");
+            onFeedback(safeTweetId, "spam");
+          });
+          bar.appendChild(spamBtn);
+
+          const humanBtn = ownerDoc.createElement("button");
+          humanBtn.type = "button";
+          humanBtn.className = "xrf-btn xrf-feedback-human";
+          humanBtn.textContent = "Not spam";
+          humanBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            ev.preventDefault?.();
+            article.removeAttribute("data-xrf-user-revealed");
+            onFeedback(safeTweetId, "human");
+          });
+          bar.appendChild(humanBtn);
+        } else {
+          const spamBtn = ownerDoc.createElement("button");
+          spamBtn.type = "button";
+          spamBtn.className = "xrf-btn xrf-feedback-spam";
+          spamBtn.textContent = "Mark bot";
+          spamBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            ev.preventDefault?.();
+            article.removeAttribute("data-xrf-user-revealed");
+            onFeedback(safeTweetId, "spam");
+          });
+          bar.appendChild(spamBtn);
+        }
       }
     }
   }
